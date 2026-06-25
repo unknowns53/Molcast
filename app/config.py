@@ -43,6 +43,22 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     PORT: int = 8080
 
+    # Local-dev only. Both default False so production deploys, which
+    # never set these env vars, never take the bypass branches. A
+    # combined startup log line (see app.main lifespan) warns loudly if
+    # either is True so a misconfigured prod deploy is obvious in logs.
+    #
+    # DEV_SKIP_SIGNATURE_VERIFICATION: bypass the Slack request signing
+    # HMAC check on /slack/mol. Useful for curl-driven testing and for
+    # tunnel-based dev where the prod signing secret is not on hand.
+    #
+    # DEV_INLINE_NAME_RESOLUTION: in the name: branch, skip Cloud Tasks
+    # and run OPSIN + RDKit + Firestore + response_url POST in a
+    # background thread. Lets `/mol name: ...` work locally without a
+    # Cloud Tasks queue or invoker service account.
+    DEV_SKIP_SIGNATURE_VERIFICATION: bool = False
+    DEV_INLINE_NAME_RESOLUTION: bool = False
+
     # EMBED_MAX_RETRIES is intentionally NOT exposed: §6.1 fixes the retry
     # count at 3 because each attempt has its own bespoke parameter set, and
     # additional attempts would have no defined parameters.

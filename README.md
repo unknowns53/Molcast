@@ -2,7 +2,7 @@
 
 生成された SMILES、IUPAC 名、座標ファイルから小分子を 3D 可視化する研究室内 Slack ツール。Cloud Run + FastAPI + Firestore + RDKit + 3Dmol.js で構築されている。設計ブリーフ全体は `Slack_分子可視化ボット_統合版_v2.md` にあり、この README ではサービスの実行・デプロイ・運用について記述する。
 
-リポジトリは現在 **Phase 1** (SMILES → 3D ビューア) の終盤にある。Phase 2 (座標ファイルのドラッグ＆ドロップ) はビューアの JavaScript 側で既に動くようになっており、有効化にあたってサーバ側の作業は不要。Phase 3 (OPSIN による IUPAC / 慣用名のパース) は `app/opsin_aliases.json` のみ用意済み。`py2opsin` (`requirements.txt`) と JRE (`Dockerfile` の `default-jre-headless`) は Phase 1 のイメージサイズ削減のため一旦外してある (Phase 3 着手時に復活、詳細は `Dockerfile` のコメント)。`app/opsin_utils.py` も未実装。
+リポジトリは Phase 1 (SMILES → 3D ビューア)、Phase 2 (座標ファイル D&D)、Phase 3 (OPSIN による IUPAC / 慣用名のパース) まで実装済み。Phase 3 では `app/opsin_utils.py` が慣用名 mapping → 同梱 OPSIN JAR (`py2opsin` wheel に同梱) → EBI OPSIN Web の三段構えで `name:` 経路を解決する。バックエンドは `OPSIN_BACKEND` 環境変数で `local` / `local_only` / `web` を選択。
 
 ## 1. 概要
 
@@ -10,7 +10,7 @@
 
 - `/mol <SMILES>` → サーバ側で 3D の MolBlock を生成し、ボットが `https://<service>/view/<random-id>` を返す。URL を開くと 3Dmol.js で分子が描画される (stick / ball-and-stick / sphere の各表示)。
 - `/mol` (引数なし) → ボットが素のビューアページ (`/view/`) へのリンクを返す。そこに `pdb` / `sdf` / `mol2` / `xyz` / `cube` ファイルをドロップするとブラウザ内で描画される。
-- `/mol name: <IUPAC name>` → Phase 3 で対応予定。
+- `/mol name: <IUPAC 名 or 慣用名>` → 慣用名 (DMSO, THF, スチレン 等) は `app/opsin_aliases.json` で即解決、それ以外は OPSIN を呼んで SMILES に変換してから SMILES 経路と同じビューアを返す。
 
 ### 用途外のもの
 
@@ -82,15 +82,15 @@ uvicorn app.main:app --reload
 
 Windows での `rdkit`: Python 3.11 の pip wheel は動作する (Docker イメージのランタイムと合わせている)。pip install が手元の環境で失敗するなら、Cloud Run のビルド経路 (`gcloud run deploy --source .`) が動作する環境を作る正規ルート。
 
-## 6. Phase 3 のローカル開発
+## 6. `name:` 経路 (Phase 3) のローカル開発
 
-`app/opsin_utils.py` はまだ未実装。実装が入った時点で、OPSIN は 3 つのモード (`OPSIN_BACKEND`) で動かせるようになる:
+OPSIN は 3 つのモード (`OPSIN_BACKEND`) で動く:
 
-- `local` — `py2opsin` を先に試し、EBI Web にフォールバック。本番のデフォルト。
-- `local_only` — `py2opsin` のみ。CI で JRE 欠落を検知するのに使う。
-- `web` — EBI Web のみ。手元に JRE を入れたくないローカル開発で指定する。
+- `local` — `app/opsin_aliases.json` の慣用名を先に引き、次に同梱 OPSIN JAR (`py2opsin` wheel に同梱の `opsin-cli-*-jar-with-dependencies.jar` を `subprocess.run` 経由で呼ぶ。タイムアウト 10 秒)。これも失敗したら EBI OPSIN Web (タイムアウト 5 秒) にフォールバック。本番のデフォルト。
+- `local_only` — alias → ローカル OPSIN のみ。Web フォールバックを切る。CI で JRE 欠落を確実に検知したいときに使う。
+- `web` — alias → EBI OPSIN Web のみ。`py2opsin` の import 自体をスキップするので、手元に JRE を入れたくないローカル開発で便利。
 
-ホスト側では `local` / `local_only` モードのために Temurin 17 (もしくは JRE 11+) を入れる:
+ホスト側で `local` / `local_only` モードのテストを動かしたいときは Temurin 17 (もしくは JRE 11+) を入れる:
 
 ```bash
 # macOS
@@ -100,7 +100,7 @@ sudo apt install default-jre-headless
 # Windows: Temurin を https://adoptium.net/ からダウンロード
 ```
 
-Phase 1 では Dockerfile から `default-jre-headless` を外している (Phase 3 着手時に戻す)。Phase 3 関連のコードをローカルで試す場合は上記のホスト JRE が必要。
+`tests/test_opsin_utils.py` は `subprocess.run` と `httpx.get` を mock するので、CI / 通常開発では JRE 不要 (alias JSON の RDKit round-trip 検証は走る)。
 
 ## 7. Docker ビルド
 
@@ -115,7 +115,7 @@ docker run --rm -p 8080:8080 \
 # http://localhost:8080/health を開く
 ```
 
-イメージはシングルステージ。Phase 1 は Python のみで、Phase 3 着手時に JRE を Dockerfile に戻す (差し戻し手順は `Dockerfile` のコメント先頭にある)。
+イメージはシングルステージ (`python:3.11-slim` + `ca-certificates` + `default-jre-headless` + RDKit + py2opsin)。OPSIN は `subprocess` 経由で JAR を叩くので JVM のウォームアップは毎回かかる (~1-2 秒)。
 
 ## 8. Cloud Run へのデプロイ
 
@@ -178,9 +178,20 @@ docker run --rm -p 8080:8080 \
   → 使い方: /mol <SMILES> ...
     座標ファイルを描画するには https://<service>/view/ を ...
 
-# (Phase 3、未実装)
+# Phase 3 (name: 経路)
 /mol name: ethanol
-  → name: 経路は Phase 3 で対応予定です。
+  → 3D viewer generated: https://<service>/view/abcd...   # alias hit (CCO)
+/mol name: DMSO
+  → 3D viewer generated: ...                              # alias hit (CS(C)=O)
+/mol name: 4-vinylpyridine
+  → 3D viewer generated: ...                              # alias hit (C=Cc1ccncc1)
+/mol name: hexafluorobenzene
+  → 3D viewer generated: ...                              # OPSIN local 解決
+/mol name: メタノール
+  → 3D viewer generated: ...                              # alias hit (CO)、kana 経路
+/mol name: not_a_real_compound
+  → OPSIN は体系名のみ対応です。慣用名・商品名は解釈できません。
+    SMILES を直接入力してください: /mol <SMILES>
 ```
 
 座標ファイル (Phase 2) はブラウザで `/view/` を開き、ビューア領域にファイルをドロップする。対応フォーマットは `pdb`、`sdf`、`mol2`、`xyz`、`cube`。CIF は手元で OpenBabel で変換する:

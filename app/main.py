@@ -36,6 +36,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from . import store, templates
 from .config import Settings, get_settings
 from .logging_config import configure_logging
+from .opsin_utils import iupac_to_smiles
 from .rdkit_utils import MoleculeGenerationError, generate_3d_molblock
 from .slack_verify import verify_slack_request
 
@@ -102,6 +103,7 @@ def _process_smiles_sync(
     channel_id: str | None,
     base_url: str,
     settings: Settings,
+    input_name: str | None = None,
 ) -> dict[str, Any]:
     """SMILES -> RDKit -> Firestore -> Slack response payload.
 
@@ -109,6 +111,10 @@ def _process_smiles_sync(
     inclusion in the HTTP response body (Slack interprets this exactly
     like a ``response_url`` POST). The caller wraps the returned dict
     in ``JSONResponse``.
+
+    ``input_name`` is the original ``/mol name: ...`` input (Phase 3); it
+    is persisted to Firestore but the rest of the pipeline operates on
+    the resolved SMILES. ``None`` for the SMILES route.
     """
     started = time.monotonic()
     try:
@@ -139,7 +145,7 @@ def _process_smiles_sync(
             mol_id=mol_id,
             smiles=smiles,
             molblock=molblock,
-            input_name=None,
+            input_name=input_name,
             created_by=user_id,
             channel_id=channel_id,
             collection=settings.FIRESTORE_COLLECTION,
@@ -156,17 +162,17 @@ def _process_smiles_sync(
         )
 
     viewer_url = f"{base_url}/view/{mol_id}"
-    logger.info(
-        "mol_created",
-        extra={
-            "mol_id": mol_id,
-            "created_by": user_id,
-            "channel_id": channel_id,
-            "smiles_len": len(smiles),
-            "molblock_len": len(molblock),
-            "elapsed_ms": int((time.monotonic() - started) * 1000),
-        },
-    )
+    log_extra: dict[str, Any] = {
+        "mol_id": mol_id,
+        "created_by": user_id,
+        "channel_id": channel_id,
+        "smiles_len": len(smiles),
+        "molblock_len": len(molblock),
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
+    if input_name is not None:
+        log_extra["input_name_len"] = len(input_name)
+    logger.info("mol_created", extra=log_extra)
     return {
         "response_type": settings.SLACK_RESPONSE_TYPE,
         "replace_original": False,
@@ -211,11 +217,46 @@ async def slack_mol(request: Request) -> JSONResponse:
         )
 
     if kind == "name":
-        # Phase 3 で OPSIN を有効化する。Phase 1 では即時に「未対応」を返す。
+        # Resolve the name to a SMILES first, then hand off to the same
+        # RDKit + Firestore pipeline as the SMILES route. The OPSIN
+        # phase is timed and logged separately (``opsin_resolved``) so
+        # ``mol_created.elapsed_ms`` continues to reflect just the
+        # RDKit + Firestore portion, matching Phase 1's metric meaning.
+        opsin_started = time.monotonic()
+        try:
+            resolved_smiles = iupac_to_smiles(
+                payload, backend=settings.OPSIN_BACKEND
+            )
+        except MoleculeGenerationError as exc:
+            logger.info(
+                "opsin_user_error",
+                extra={
+                    "error_kind": "MoleculeGenerationError",
+                    "backend": settings.OPSIN_BACKEND,
+                    "input_name_len": len(payload),
+                    "elapsed_ms": int((time.monotonic() - opsin_started) * 1000),
+                },
+            )
+            return JSONResponse(
+                _ephemeral(str(exc), response_type=settings.SLACK_RESPONSE_TYPE)
+            )
+        logger.info(
+            "opsin_resolved",
+            extra={
+                "backend": settings.OPSIN_BACKEND,
+                "input_name_len": len(payload),
+                "smiles_len": len(resolved_smiles),
+                "elapsed_ms": int((time.monotonic() - opsin_started) * 1000),
+            },
+        )
         return JSONResponse(
-            _ephemeral(
-                "`name:` 経路は Phase 3 で対応予定です。"
-                "現在は SMILES を直接入力してください: `/mol <SMILES>`"
+            _process_smiles_sync(
+                smiles=resolved_smiles,
+                input_name=payload,
+                user_id=user_id,
+                channel_id=channel_id,
+                base_url=base_url,
+                settings=settings,
             )
         )
 

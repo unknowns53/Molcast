@@ -7,6 +7,8 @@ httpx>=0.27,<1.0
 rdkit>=2024.3.1
 pydantic-settings>=2.2,<3.0
 
-# Phase 3 dependencies (commented out for image size; restore together
-# with `default-jre-headless` in Dockerfile when Phase 3 starts).
-# py2opsin>=1.0.1
+# Phase 3 (OPSIN local backend). Requires `default-jre-headless` at
+# runtime — installed in Dockerfile. py2opsin ships a CLI JAR; we call
+# it via subprocess directly to get a real timeout (the py2opsin Python
+# API has no per-call timeout). See app/opsin_utils.py:_resolve_jar_path.
+py2opsin>=1.0.1

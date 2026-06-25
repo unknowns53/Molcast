@@ -31,4 +31,10 @@ gcloud run deploy "$SERVICE_NAME" \
     --allow-unauthenticated \
     --set-env-vars "SLACK_RESPONSE_TYPE=ephemeral,FIRESTORE_COLLECTION=molecules,RETENTION_DAYS=7,MAX_ATOMS=200,OPSIN_BACKEND=local" \
     --set-secrets "SLACK_SIGNING_SECRET=${SECRET_NAME}:latest" \
+    --cpu-throttling \
     --min-instances "$MIN_INSTANCES"
+# NOTE: --cpu-throttling is the Cloud Run default and is enumerated here
+# only to make the choice explicit. Do NOT replace it with
+# --no-cpu-throttling: Phase 1 runs /slack/mol synchronously, so it does
+# not benefit from always-allocated CPU, and the latter mode bills CPU
+# continuously while an instance is active.

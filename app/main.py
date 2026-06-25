@@ -4,14 +4,24 @@ Endpoint summary:
 
   GET  /health         -> liveness check.
   POST /slack/mol      -> Slack slash command; verify signature, classify
-                          ``text``, dispatch a BackgroundTask, return ack.
+                          ``text``, run RDKit + Firestore synchronously,
+                          return the viewer URL (or an error message)
+                          directly in the response body.
   GET  /view/{mol_id}  -> render 3Dmol.js viewer with stored MolBlock.
   GET  /view/, GET /   -> bare viewer (drop-zone for coordinate files).
 
-The slash command flow is always two-stage (sync ack + async result via
-``response_url``), even when the work would fit in 3 seconds. §5.2 calls
-this out explicitly: a single code path is easier to reason about than
-a sometimes-sync / sometimes-async hybrid.
+Phase 1 deviates from the brief's §5.2 ack-then-response_url two-stage
+flow for one reason: Cloud Run's default ``cpu-throttling=always`` puts
+the FastAPI ``BackgroundTasks`` body into a near-stalled state after
+the ack response is returned, and the alternative (``--no-cpu-
+throttling``) carries continuous CPU billing. A synchronous response
+keeps cpu-throttling at its default (zero-cost-when-idle) AND fits
+within Slack's 3-second ack window for the lightweight molecules the
+lab actually uses; the cold-start case may occasionally exceed 3 s,
+in which case the user simply re-issues the command on a warm
+instance. The ``slack_dispatch`` module is retained because Phase 3
+(OPSIN with JVM cold start) may push past 3 s and require the
+two-stage flow there.
 """
 from __future__ import annotations
 
@@ -20,14 +30,13 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import store, templates
 from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .rdkit_utils import MoleculeGenerationError, generate_3d_molblock
-from .slack_dispatch import post_to_response_url
 from .slack_verify import verify_slack_request
 
 logger = logging.getLogger("molcast.main")
@@ -86,18 +95,22 @@ def _classify_text(text: str) -> tuple[str, str]:
     return ("smiles", cleaned)
 
 
-def _process_smiles_job(
+def _process_smiles_sync(
     *,
     smiles: str,
-    response_url: str,
     user_id: str | None,
     channel_id: str | None,
     base_url: str,
     settings: Settings,
-) -> None:
-    """BackgroundTask body: SMILES -> RDKit -> Firestore -> response_url."""
+) -> dict[str, Any]:
+    """SMILES -> RDKit -> Firestore -> Slack response payload.
+
+    Synchronous: every branch returns a dict suitable for direct
+    inclusion in the HTTP response body (Slack interprets this exactly
+    like a ``response_url`` POST). The caller wraps the returned dict
+    in ``JSONResponse``.
+    """
     started = time.monotonic()
-    mol_id = store.new_mol_id()
     try:
         molblock = generate_3d_molblock(smiles, max_atoms=settings.MAX_ATOMS)
     except MoleculeGenerationError as exc:
@@ -109,25 +122,18 @@ def _process_smiles_job(
                 "elapsed_ms": int((time.monotonic() - started) * 1000),
             },
         )
-        post_to_response_url(
-            response_url,
-            _ephemeral(str(exc), response_type=settings.SLACK_RESPONSE_TYPE),
-        )
-        return
+        return _ephemeral(str(exc), response_type=settings.SLACK_RESPONSE_TYPE)
     except Exception:  # pragma: no cover - defensive
         logger.exception(
             "rdkit_unexpected_error",
             extra={"smiles_len": len(smiles)},
         )
-        post_to_response_url(
-            response_url,
-            _ephemeral(
-                "予期しないエラーが発生しました。SMILES をご確認ください。",
-                response_type=settings.SLACK_RESPONSE_TYPE,
-            ),
+        return _ephemeral(
+            "予期しないエラーが発生しました。SMILES をご確認ください。",
+            response_type=settings.SLACK_RESPONSE_TYPE,
         )
-        return
 
+    mol_id = store.new_mol_id()
     try:
         store.save_molecule(
             mol_id=mol_id,
@@ -144,14 +150,10 @@ def _process_smiles_job(
             "firestore_save_failed",
             extra={"mol_id": mol_id, "molblock_len": len(molblock)},
         )
-        post_to_response_url(
-            response_url,
-            _ephemeral(
-                "保存に失敗しました。しばらく待ってから再度お試しください。",
-                response_type=settings.SLACK_RESPONSE_TYPE,
-            ),
+        return _ephemeral(
+            "保存に失敗しました。しばらく待ってから再度お試しください。",
+            response_type=settings.SLACK_RESPONSE_TYPE,
         )
-        return
 
     viewer_url = f"{base_url}/view/{mol_id}"
     logger.info(
@@ -165,20 +167,15 @@ def _process_smiles_job(
             "elapsed_ms": int((time.monotonic() - started) * 1000),
         },
     )
-    post_to_response_url(
-        response_url,
-        _ephemeral(
-            f"3D viewer generated: {viewer_url}",
-            response_type=settings.SLACK_RESPONSE_TYPE,
-        ),
-    )
+    return {
+        "response_type": settings.SLACK_RESPONSE_TYPE,
+        "replace_original": False,
+        "text": f"3D viewer generated: {viewer_url}",
+    }
 
 
 @app.post("/slack/mol")
-async def slack_mol(
-    request: Request,
-    background_tasks: BackgroundTasks,
-) -> JSONResponse:
+async def slack_mol(request: Request) -> JSONResponse:
     settings = get_settings()
     body = await request.body()
 
@@ -198,7 +195,6 @@ async def slack_mol(
     form = {k: v[0] for k, v in form_raw.items() if v}
 
     text = form.get("text", "")
-    response_url = form.get("response_url", "")
     user_id = form.get("user_id")
     channel_id = form.get("channel_id")
 
@@ -223,26 +219,16 @@ async def slack_mol(
             )
         )
 
-    if not response_url:
-        # Slack from a real workspace always sends response_url; defensive
-        # so a misconfigured tester does not silently lose the job.
-        return JSONResponse(
-            _ephemeral(
-                "response_url が見つかりません。Slack App の設定をご確認ください。"
-            )
-        )
-
-    background_tasks.add_task(
-        _process_smiles_job,
-        smiles=payload,
-        response_url=response_url,
-        user_id=user_id,
-        channel_id=channel_id,
-        base_url=base_url,
-        settings=settings,
-    )
+    # SMILES path — runs synchronously and returns the viewer URL or an
+    # error message directly. No response_url callback needed.
     return JSONResponse(
-        _ephemeral("処理中です... 完了したら結果をこのスレッドに投稿します。")
+        _process_smiles_sync(
+            smiles=payload,
+            user_id=user_id,
+            channel_id=channel_id,
+            base_url=base_url,
+            settings=settings,
+        )
     )
 
 

@@ -1,51 +1,31 @@
-# Molcast — Slack molecule visualization bot
+# Molcast — Slack 分子可視化ボット
 
-Internal Slack tool for visualising small molecules in 3D, directly from
-generated SMILES, IUPAC names, or coordinate files. Built on Cloud Run +
-FastAPI + Firestore + RDKit + 3Dmol.js. The full design brief lives in
-`Slack_分子可視化ボット_統合版_v2.md`; this README describes how to run,
-deploy, and operate the service.
+生成された SMILES、IUPAC 名、座標ファイルから小分子を 3D 可視化する研究室内 Slack ツール。Cloud Run + FastAPI + Firestore + RDKit + 3Dmol.js で構築されている。設計ブリーフ全体は `Slack_分子可視化ボット_統合版_v2.md` にあり、この README ではサービスの実行・デプロイ・運用について記述する。
 
-The repository is currently at the end of **Phase 1** (SMILES → 3D
-viewer). Phase 2 (coordinate file drag-and-drop) is already exercised
-by the viewer JavaScript — no server-side work is required to enable
-it. Phase 3 (IUPAC / trivial-name parsing via OPSIN) is scaffolded
-(`app/opsin_aliases.json`, `py2opsin` in `requirements.txt`, JRE in
-`Dockerfile`) but `app/opsin_utils.py` is not yet implemented.
+リポジトリは現在 **Phase 1** (SMILES → 3D ビューア) の終盤にある。Phase 2 (座標ファイルのドラッグ＆ドロップ) はビューアの JavaScript 側で既に動くようになっており、有効化にあたってサーバ側の作業は不要。Phase 3 (OPSIN による IUPAC / 慣用名のパース) は `app/opsin_aliases.json` のみ用意済み。`py2opsin` (`requirements.txt`) と JRE (`Dockerfile` の `default-jre-headless`) は Phase 1 のイメージサイズ削減のため一旦外してある (Phase 3 着手時に復活、詳細は `Dockerfile` のコメント)。`app/opsin_utils.py` も未実装。
 
-## 1. Overview
+## 1. 概要
 
-### What it does
+### できること
 
-- `/mol <SMILES>` → 3D MolBlock is generated server-side; the bot replies
-  with `https://<service>/view/<random-id>`. Opening the URL renders the
-  molecule with 3Dmol.js (stick / ball-and-stick / sphere views).
-- `/mol` (no argument) → bot replies with a link to the bare viewer
-  page (`/view/`) where any `pdb` / `sdf` / `mol2` / `xyz` / `cube` file
-  can be dropped to render it in-browser.
-- `/mol name: <IUPAC name>` → planned for Phase 3.
+- `/mol <SMILES>` → サーバ側で 3D の MolBlock を生成し、ボットが `https://<service>/view/<random-id>` を返す。URL を開くと 3Dmol.js で分子が描画される (stick / ball-and-stick / sphere の各表示)。
+- `/mol` (引数なし) → ボットが素のビューアページ (`/view/`) へのリンクを返す。そこに `pdb` / `sdf` / `mol2` / `xyz` / `cube` ファイルをドロップするとブラウザ内で描画される。
+- `/mol name: <IUPAC name>` → Phase 3 で対応予定。
 
-### What it is NOT for
+### 用途外のもの
 
-Quick visual sanity-check only. Conformer searches, energy minimisation
-beyond a single MMFF/UFF pass, DFT, MD, and OCSR are explicitly out of
-scope; use RDKit / Gaussian / GROMACS for those.
+ざっくりとした見た目の確認用途のみ。配座探索、MMFF/UFF 単発を超える構造最適化、DFT、MD、OCSR は明示的に対象外で、その用途には RDKit / Gaussian / GROMACS を使う。
 
-## 2. Slack App setup
+## 2. Slack App のセットアップ
 
-1. Open <https://api.slack.com/apps> and click **Create New App** →
-   *From scratch*. Name it (e.g. `Molcast`) and pick the target
-   workspace.
-2. Under **OAuth & Permissions** → *Scopes* → *Bot Token Scopes*, add
-   `commands` and `chat:write`.
-3. Under **Basic Information**, copy the **Signing Secret**. Store it
-   in Secret Manager — see §8.
-4. Install the app to the workspace. If *Require approved apps* is on,
-   the workspace admin must approve it first.
+1. <https://api.slack.com/apps> を開いて **Create New App** → *From scratch* をクリック。名前 (例: `Molcast`) と対象ワークスペースを指定する。
+2. **OAuth & Permissions** → *Scopes* → *Bot Token Scopes* で `commands` と `chat:write` を追加する。
+3. **Basic Information** から **Signing Secret** をコピーする。Secret Manager に保管する — §8 を参照。
+4. アプリをワークスペースにインストールする。*Require approved apps* が有効な場合、ワークスペース管理者の承認が先に必要。
 
-## 3. Slash command setup
+## 3. Slash command のセットアップ
 
-Under **Slash Commands** → *Create New Command*:
+**Slash Commands** → *Create New Command*:
 
 | Field | Value |
 |---|---|
@@ -54,104 +34,92 @@ Under **Slash Commands** → *Create New Command*:
 | Short description | `SMILES や座標ファイルから 3D 分子ビューアを生成` |
 | Usage hint | `<SMILES> または name: <IUPAC>` |
 
-Save. Re-install the app to the workspace to pick up the new command.
+保存する。新しいコマンドを反映するためにアプリをワークスペースに再インストールする。
 
-## 4. Environment variables
+## 4. 環境変数
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `SLACK_SIGNING_SECRET` | yes | — | Slack request signing (HMAC-SHA256) |
-| `SLACK_RESPONSE_TYPE` | no | `ephemeral` | `ephemeral` or `in_channel` |
-| `BASE_URL` | no | from request | Used for the `/view/{id}` link |
-| `FIRESTORE_COLLECTION` | no | `molecules` | Firestore collection name |
-| `RETENTION_DAYS` | no | `7` | `/view/{id}` TTL |
-| `MAX_ATOMS` | no | `200` | Atom-count gate after `AddHs` |
+| `SLACK_SIGNING_SECRET` | yes | — | Slack リクエスト署名 (HMAC-SHA256) |
+| `SLACK_RESPONSE_TYPE` | no | `ephemeral` | `ephemeral` か `in_channel` |
+| `BASE_URL` | no | リクエストから取得 | `/view/{id}` リンクに使う |
+| `FIRESTORE_COLLECTION` | no | `molecules` | Firestore のコレクション名 |
+| `RETENTION_DAYS` | no | `7` | `/view/{id}` の TTL |
+| `MAX_ATOMS` | no | `200` | `AddHs` 後の原子数ゲート |
 | `OPSIN_BACKEND` | no | `local` | Phase 3: `local` / `local_only` / `web` |
-| `OPSIN_JAR_PATH` | no | `/opt/opsin/opsin.jar` | Phase 3 fallback path |
-| `OPSIN_WEB_URL` | no | `https://opsin.ch.cam.ac.uk/opsin/` | Phase 3 EBI endpoint |
-| `LOG_LEVEL` | no | `INFO` | Python `logging` level |
-| `PORT` | — | Cloud Run injects | Uvicorn bind port |
+| `OPSIN_JAR_PATH` | no | `/opt/opsin/opsin.jar` | Phase 3 のフォールバックパス |
+| `OPSIN_WEB_URL` | no | `https://opsin.ch.cam.ac.uk/opsin/` | Phase 3 の EBI エンドポイント |
+| `LOG_LEVEL` | no | `INFO` | Python `logging` のレベル |
+| `PORT` | — | Cloud Run が注入 | Uvicorn のバインドポート |
 
-`EMBED_MAX_RETRIES` is intentionally NOT exposed; the embed retry budget
-is fixed at three because each attempt uses its own ETKDGv3 parameter
-set (see `app/rdkit_utils.py` and §6.1 of the design brief).
+`EMBED_MAX_RETRIES` は意図的に外に出していない。各試行は独自の ETKDGv3 パラメータセットを使うため、埋め込み再試行回数は 3 回で固定している (`app/rdkit_utils.py` および設計ブリーフ §6.1 を参照)。
 
-## 5. Local development
+## 5. ローカル開発
 
 ```bash
 python -m venv .venv
-. .venv/bin/activate           # or: .venv\Scripts\activate
+. .venv/bin/activate           # または: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 cp .env.example .env
 
-# Run unit tests (no Firestore required — store is mocked):
+# 単体テストを実行 (Firestore は不要 — ストアはモック化されている):
 pytest
 
-# Run the service. Without a Firestore credential the /view/{id} and
-# /slack/mol POST endpoints will fail at the Firestore call; the
-# /health, /view/, /, and viewer endpoints with manual D&D work.
+# サービスを起動。Firestore のクレデンシャルが無いと /view/{id} と
+# /slack/mol の POST エンドポイントは Firestore 呼び出しで落ちる。
+# /health、/view/、/、手動 D&D のビューアエンドポイントは動く。
 uvicorn app.main:app --reload
 ```
 
-To exercise the Firestore-backed paths locally, run the Firestore
-emulator alongside (after `gcloud components install
-cloud-firestore-emulator`):
+ローカルで Firestore 経由のパスを試したい場合は、Firestore エミュレータを並行起動する (`gcloud components install cloud-firestore-emulator` を実行した後で):
 
 ```bash
 gcloud emulators firestore start --host-port=localhost:8088
-# In another shell:
+# 別シェルで:
 export FIRESTORE_EMULATOR_HOST=localhost:8088
 uvicorn app.main:app --reload
 ```
 
-`rdkit` on Windows: the pip wheel works for Python 3.11 (the runtime
-matches the Docker image). If pip install fails on your platform, the
-Cloud Run build path (`gcloud run deploy --source .`) is the
-authoritative way to get a working environment.
+Windows での `rdkit`: Python 3.11 の pip wheel は動作する (Docker イメージのランタイムと合わせている)。pip install が手元の環境で失敗するなら、Cloud Run のビルド経路 (`gcloud run deploy --source .`) が動作する環境を作る正規ルート。
 
-## 6. Phase 3 local development
+## 6. Phase 3 のローカル開発
 
-`app/opsin_utils.py` is not yet implemented. When it lands, OPSIN can be
-exercised in three modes (`OPSIN_BACKEND`):
+`app/opsin_utils.py` はまだ未実装。実装が入った時点で、OPSIN は 3 つのモード (`OPSIN_BACKEND`) で動かせるようになる:
 
-- `local` — `py2opsin` first, EBI Web fallback. Default for production.
-- `local_only` — `py2opsin` only. Use in CI to catch a missing JRE.
-- `web` — EBI Web only. Set this for local development if you do not
-  want to install a JRE.
+- `local` — `py2opsin` を先に試し、EBI Web にフォールバック。本番のデフォルト。
+- `local_only` — `py2opsin` のみ。CI で JRE 欠落を検知するのに使う。
+- `web` — EBI Web のみ。手元に JRE を入れたくないローカル開発で指定する。
 
-On the host, install Temurin 17 (or any JRE 11+) for the `local` /
-`local_only` modes:
+ホスト側では `local` / `local_only` モードのために Temurin 17 (もしくは JRE 11+) を入れる:
 
 ```bash
 # macOS
 brew install --cask temurin@17
 # Debian/Ubuntu
 sudo apt install default-jre-headless
-# Windows: download Temurin from https://adoptium.net/
+# Windows: Temurin を https://adoptium.net/ からダウンロード
 ```
 
-The Dockerfile already includes `default-jre-headless`, so the Cloud
-Run image does not need any host-side JRE.
+Phase 1 では Dockerfile から `default-jre-headless` を外している (Phase 3 着手時に戻す)。Phase 3 関連のコードをローカルで試す場合は上記のホスト JRE が必要。
 
-## 7. Docker build
+## 7. Docker ビルド
 
 ```bash
 docker build -t molcast .
 
-# Local smoke test (without Firestore credentials):
+# ローカルのスモークテスト (Firestore クレデンシャルなし):
 docker run --rm -p 8080:8080 \
     -e SLACK_SIGNING_SECRET=dummy \
     -e GOOGLE_APPLICATION_CREDENTIALS=/dev/null \
     molcast
-# Open http://localhost:8080/health
+# http://localhost:8080/health を開く
 ```
 
-The image is single-stage (Python + JRE). Phase 3 will not require a
-rebuild path change — see `Dockerfile` for the rationale.
+イメージはシングルステージ。Phase 1 は Python のみで、Phase 3 着手時に JRE を Dockerfile に戻す (差し戻し手順は `Dockerfile` のコメント先頭にある)。
 
-## 8. Cloud Run deployment
+## 8. Cloud Run へのデプロイ
 
-1. Create the project and enable APIs:
+1. プロジェクトを作成して API を有効化する:
 
    ```bash
    gcloud config set project YOUR_PROJECT_ID
@@ -161,7 +129,7 @@ rebuild path change — see `Dockerfile` for the rationale.
        artifactregistry.googleapis.com
    ```
 
-2. Store the Slack signing secret in Secret Manager:
+2. Slack の signing secret を Secret Manager に保管する:
 
    ```bash
    echo -n "$(read -s SS; echo "$SS")" | \
@@ -169,32 +137,26 @@ rebuild path change — see `Dockerfile` for the rationale.
            --data-file=- --replication-policy=automatic
    ```
 
-3. Deploy:
+3. デプロイ:
 
    ```bash
    PROJECT_ID=YOUR_PROJECT_ID ./deploy.sh
    ```
 
-4. Note the printed service URL and paste it (with `/slack/mol`
-   appended) into the Slack command's *Request URL* field.
+4. 表示されるサービス URL を控え、末尾に `/slack/mol` を付けたものを Slack コマンドの *Request URL* に貼り付ける。
 
-## 9. Firestore enablement and TTL
+## 9. Firestore の有効化と TTL
 
-1. In the GCP console, **Firestore → Native mode**, choose region
-   `asia-northeast1` (same as Cloud Run). Native mode is required.
-2. The code uses `expires_at` for per-request expiry checks, so a TTL
-   policy is optional. To enable automatic deletion (with up to 24 h
-   delay):
+1. GCP コンソールの **Firestore → Native mode** で、リージョンに `asia-northeast1` (Cloud Run と同じ) を選ぶ。Native mode が必須。
+2. コードはリクエストごとの期限チェックで `expires_at` を使っているため、TTL ポリシーは任意。自動削除を有効化する場合 (反映に最大 24 時間の遅延あり):
 
    - **Firestore → TTL → Add policy**
    - Collection: `molecules`
    - Field: `expires_at`
 
-   Until the TTL policy is enabled, expired documents linger but
-   `/view/{id}` correctly returns the expired page (the code rejects
-   them via the `{"expired": True}` sentinel).
+   TTL ポリシーを有効化するまで期限切れドキュメントは残り続けるが、`/view/{id}` は期限切れページを正しく返す (コードが `{"expired": True}` センチネルで弾く)。
 
-## 10. Usage examples
+## 10. 使用例
 
 ```text
 /mol CCO
@@ -216,78 +178,55 @@ rebuild path change — see `Dockerfile` for the rationale.
   → 使い方: /mol <SMILES> ...
     座標ファイルを描画するには https://<service>/view/ を ...
 
-# (Phase 3, not yet implemented)
+# (Phase 3、未実装)
 /mol name: ethanol
   → name: 経路は Phase 3 で対応予定です。
 ```
 
-For coordinate files (Phase 2), open `/view/` in a browser and drop the
-file onto the viewer pane. Supported formats: `pdb`, `sdf`, `mol2`,
-`xyz`, `cube`. For CIF, convert at the desk with OpenBabel:
+座標ファイル (Phase 2) はブラウザで `/view/` を開き、ビューア領域にファイルをドロップする。対応フォーマットは `pdb`、`sdf`、`mol2`、`xyz`、`cube`。CIF は手元で OpenBabel で変換する:
 
 ```bash
 obabel input.cif -O output.xyz
 ```
 
-## 11. Operations and tuning
+## 11. 運用とチューニング
 
-### Cold start
+### Slack ハンドラのフロー
 
-Without `--min-instances 1`, Cloud Run will spin instances down to 0
-after a few minutes of idle. The first request after a cold spell pays
-the RDKit import (~1 s) plus instance startup (~1–2 s) — well inside
-the 3-second Slack `ack` budget thanks to the two-stage flow (ack
-synchronously, post the viewer URL via `response_url` afterwards).
+Phase 1 は `/slack/mol` を**同期処理**で完結させている。設計ブリーフ §5.2 の「ack 即返 + `response_url` 後追い」二段フローは Cloud Run の `cpu-throttling=always` (デフォルト) と相性が悪く、ack 返却直後に CPU が絞られて `BackgroundTasks` が事実上停止するため。同期 1 パスにすれば cpu-throttling のデフォルト挙動 (アイドル時 0 課金) を維持できる。Phase 3 で OPSIN の JVM 起動コストが 3 秒制約を圧迫し始めたら二段フローを再導入する想定で、`app/slack_dispatch.py` は温存している。
 
-If users start reporting late results (>5 s for the viewer URL to
-appear), measure cold-start frequency in the Cloud Run logs and, if
-warranted, switch to:
+### コールドスタート
+
+`--min-instances 1` 無しだと Cloud Run は数分のアイドル後にインスタンスを 0 まで落とす。アイドル明け初回リクエストは RDKit の import (~1 秒) + インスタンス起動 (~1〜2 秒) + RDKit embed (CCO で ~0.5 秒) で計 3 秒前後 — Slack の 3 秒 ack 制限のギリギリ。普通分子なら大半通るが、運悪く溢れたら `アプリが応答しなかった` として Slack 側でタイムアウト表示される。その場合はユーザーが同じコマンドを再投入すれば warm インスタンスで通る。
+
+頻発するなら以下に切り替える:
 
 ```bash
 MIN_INSTANCES=1 PROJECT_ID=... ./deploy.sh
 ```
 
-`--min-instances 1` keeps one instance warm 24/7 — the steady-state
-cost is roughly the price of one always-on small Cloud Run instance
-(see Cloud Run pricing for `asia-northeast1` vCPU/memory rates).
+`--min-instances 1` は 1 インスタンスを 24 時間常時暖機状態に保つ。cpu-throttling は default のままなのでアイドル時の CPU 課金は無く、メモリ常時分の課金が乗るだけ — 月数百円程度 (実トラフィック次第で `asia-northeast1` の Cloud Run 価格表を参照)。
 
-### Logging
+### ロギング
 
-Logs are structured JSON on stdout — Cloud Logging picks them up
-automatically. Allowed structured fields are listed in
-`app/logging_config.py`; **SMILES bodies and MolBlocks are never logged
-in raw form**, only sizes / counts / identifiers.
+ログは stdout への構造化 JSON で、Cloud Logging が自動で拾う。許可された構造化フィールドは `app/logging_config.py` に列挙されている。**SMILES 本体と MolBlock は生のまま記録されることは絶対に無い**、記録するのはサイズ・件数・識別子だけ。
 
-### `response_url` retries
+ERROR レベルの例外スタックトレースは `gcloud run services logs read` だと出ない場合があるので、Firestore 例外や RDKit 例外を追うときは Cloud Logging コンソール (<https://console.cloud.google.com/logs>) で severity フィルタ `>= ERROR` を使うのが手早い。
 
-The async path retries the `response_url` POST twice (exponential
-back-off) on 5xx or network errors. Persistent failures land in the
-logs under `response_url POST failed after retries` — query Cloud
-Logging for that string to spot Slack outages.
+### `response_url` のリトライ (Phase 3 用、Phase 1 では未使用)
 
-## 12. Security notes
+`app/slack_dispatch.py` は 5xx またはネットワークエラー時に `response_url` への POST を 2 回 (指数バックオフ) 再試行する実装が入っているが、Phase 1 の同期フローでは呼ばれない。Phase 3 で `name:` 経路を非同期化するときに再利用する。継続的に失敗するとログに `response_url POST failed after retries` として残るので、その時に Cloud Logging でこの文字列を検索する。
 
-- **Signing secret hygiene.** Never put the raw secret in `deploy.sh`,
-  `.env`, or any committed file. It lives in Secret Manager and is
-  injected at runtime via `--set-secrets` (see `deploy.sh`).
-- **No log leakage.** The structured logger only emits whitelisted
-  fields. The uvicorn access-log filter masks query strings. If you
-  add a new log call, do not pass raw SMILES via `extra=`.
-- **`/view/{id}` is unguessable but not authenticated.** Anyone with
-  the URL can see the molecule, so treat the URL itself as the secret
-  for that view. Phase 1 / 2 / 3 are not designed for confidential
-  data (see §1 of the design brief).
-- **Atom-count gate.** `MAX_ATOMS=200` after `AddHs` blocks the most
-  obvious DoS payload (a kilo-atom SMILES); a malicious caller can
-  still spend RDKit CPU on a 199-atom embed retry. If misuse becomes
-  visible, add a Cloud Run concurrency cap (`--concurrency`) or
-  per-user rate limit.
-- **Pre-commit hooks.** This repository ships `hooks/pre-commit` and
-  `hooks/commit-msg` which read `.git-banned-patterns` (gitignored) to
-  block accidental leakage of personal identifiers. On a fresh clone:
+## 12. セキュリティに関するメモ
+
+- **Signing secret の扱い。** 生のシークレットを `deploy.sh`、`.env`、コミット対象のファイルに置かない。Secret Manager に置き、`--set-secrets` でランタイム注入する (`deploy.sh` を参照)。
+- **ログ漏洩なし。** 構造化ロガーはホワイトリスト化されたフィールドのみ出力する。uvicorn のアクセスログフィルタはクエリ文字列をマスクする。新しいログ呼び出しを追加する場合、生の SMILES を `extra=` で渡さないこと。
+- **`/view/{id}` は推測不能だが認証は無い。** URL を知っている人なら誰でも分子を閲覧できるので、その閲覧に関しては URL 自体がシークレットだと考える。Phase 1 / 2 / 3 は機密データ向けには設計されていない (設計ブリーフ §1 を参照)。
+- **原子数ゲート。** `AddHs` 後の `MAX_ATOMS=200` で最も明白な DoS ペイロード (キロ原子クラスの SMILES) は弾けるが、悪意ある呼び出し側が 199 原子の埋め込み再試行に RDKit の CPU を浪費させることは依然として可能。悪用が顕在化してきたら、Cloud Run の同時実行数上限 (`--concurrency`) かユーザー単位のレート制限を追加する。
+- **Pre-commit フック。** このリポジトリは `hooks/pre-commit` と `hooks/commit-msg` を同梱しており、`.git-banned-patterns` (gitignore 済み) を読んで個人識別子の誤コミットを機械的に止める。新規 clone 時:
 
   ```bash
   cp .git-banned-patterns.example .git-banned-patterns
-  # edit to taste
+  # 好みで編集する
   git config core.hooksPath hooks
   ```

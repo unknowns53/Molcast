@@ -87,3 +87,15 @@ def test_drop_zone_is_exposed_to_assistive_tech():
     assert 'id="dropzone"' in html
     # The whole rendered HTML must contain no aria-hidden on the dropzone.
     assert 'id="dropzone" aria-hidden' not in html
+
+
+def test_reset_view_restores_initial_camera():
+    """3Dmol's zoomTo() only normalises distance — it leaves the user's
+    rotation in place, so a bare zoomTo() does not actually reset the
+    view. The viewer must snapshot getView() right after the model
+    loads and use setView() on Reset to restore the full camera."""
+    html = render_viewer_html("CCO", "M  END\n", "id1")
+    # Snapshot is taken after the initial render.
+    assert "initialView = viewer.getView();" in html
+    # Reset handler uses setView, not a bare zoomTo.
+    assert "viewer.setView(initialView)" in html

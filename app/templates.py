@@ -135,14 +135,21 @@ def render_viewer_html(
         return;
     }}
     let modelLoaded = false;
+    // Snapshot of the camera right after the model loads. We can't just
+    // call zoomTo() on Reset because 3Dmol's zoomTo() only normalises
+    // distance — it leaves the user's rotation in place. setView()/
+    // getView() bundle position + rotation + zoom so a round-trip
+    // through them fully restores the initial framing.
+    let initialView = null;
 
     function loadModel(text, fmt) {{
         try {{
             viewer.clear();
             viewer.addModel(text, fmt);
-            viewer.setStyle({{}}, {{ stick: {{}} }});
+            viewer.setStyle({{}}, {{ stick: {{ radius: 0.15 }}, sphere: {{ scale: 0.25 }} }});
             viewer.zoomTo();
             viewer.render();
+            initialView = viewer.getView();
             modelLoaded = true;
             if (dropzone) dropzone.style.display = 'none';
             clearError();
@@ -195,7 +202,12 @@ def render_viewer_html(
         viewer.setStyle({{}}, {{ sphere: {{}} }}); viewer.render();
     }});
     document.getElementById('btn-reset').addEventListener('click', function () {{
-        viewer.zoomTo(); viewer.render();
+        if (initialView) {{
+            viewer.setView(initialView);
+        }} else {{
+            viewer.zoomTo();
+        }}
+        viewer.render();
     }});
 }})();
 """

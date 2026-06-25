@@ -1,0 +1,75 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Build / packaging artifacts ---
+build/
+dist/
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS-specific ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- Secrets / local config ---
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+service-account*.json
+gcp-key*.json
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Local data ---
+storage.db
+*.sqlite
+*.sqlite3
+fixtures/local/
+
+# --- Pre-commit banned patterns (per-developer, never committed) ---
+.git-banned-patterns
+
+# --- Claude Code / local AI state ---
+.claude/
+
+# --- OPSIN / OCSR binaries (downloaded by Dockerfile, not committed) ---
+opsin*.jar
+app/opsin*.jar
+*.h5
+*.pt
+*.pth
+*.onnx
+*.ckpt
+
+# --- Docker / Cloud Run local state ---
+.docker/
+
+# --- Node (just in case Viewer build tools land here) ---
+node_modules/
+package-lock.json

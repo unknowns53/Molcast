@@ -1,0 +1,41 @@
+# Default: let git auto-detect text/binary and normalize line endings on commit.
+* text=auto
+
+# Text files: force LF in the repo. Prevents Windows checkouts from getting
+# CRLF in places that break shell scripts and JSON tooling.
+*.py    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.html  text eol=lf
+*.css   text eol=lf
+*.js    text eol=lf
+*.txt   text eol=lf
+*.cfg   text eol=lf
+*.ini   text eol=lf
+Dockerfile text eol=lf
+
+# Hooks are bash scripts (extensionless). Force LF or Git Bash on Windows
+# fails with `bash: '\r': command not found` on the shebang line.
+hooks/*  text eol=lf
+
+# Binaries: never normalize.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tar   binary
+*.jar   binary
+*.h5    binary
+*.pt    binary
+*.pth   binary
+*.onnx  binary
+*.ckpt  binary
+*.so    binary
+*.dll   binary

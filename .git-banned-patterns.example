@@ -1,0 +1,30 @@
+# Banned-pattern template for pre-commit / commit-msg hooks.
+#
+# On a fresh clone:
+#   1. cp .git-banned-patterns.example .git-banned-patterns
+#   2. Uncomment and edit the lines below with patterns you want to block.
+#   3. Run: git config core.hooksPath hooks
+#
+# Rules:
+#   - One pattern per line.
+#   - Lines starting with `#` and blank lines are ignored.
+#   - Matching is case-insensitive substring (grep -i -F).
+#   - Patterns may include spaces and non-ASCII (UTF-8) characters.
+#   - `.git-banned-patterns` itself is gitignored — your patterns never leave your clone.
+#
+# Examples (uncomment and replace with your own values):
+#
+# Full name (English, lowercase form will match upper too):
+# yamada taro
+#
+# Full name (Japanese):
+# 山田太郎
+#
+# Conversational nickname or handle that should not appear in commits/code:
+# nickname-here
+#
+# Student / employee ID:
+# A12345
+#
+# Affiliation details that should stay out of public repos:
+# example university chemistry department

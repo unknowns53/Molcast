@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Commit-msg hook: block commit messages that contain any banned pattern.
+#
+# Patterns are read from .git-banned-patterns (same file as pre-commit).
+# Matching is case-insensitive substring (-i -F).
+
+set -euo pipefail
+
+PATTERNS_FILE=".git-banned-patterns"
+COMMIT_MSG_FILE="$1"
+
+if [ ! -f "$PATTERNS_FILE" ]; then
+    echo "commit-msg: $PATTERNS_FILE not found, skipping pattern check." >&2
+    exit 0
+fi
+
+patterns=$(grep -v -E '^\s*$|^\s*#' "$PATTERNS_FILE" || true)
+if [ -z "$patterns" ]; then
+    exit 0
+fi
+
+found=0
+while IFS= read -r pattern; do
+    [ -z "$pattern" ] && continue
+    if grep -i -F -- "$pattern" "$COMMIT_MSG_FILE" >/dev/null 2>&1; then
+        echo "commit-msg ERROR: banned pattern '$pattern' found in commit message" >&2
+        found=1
+    fi
+done <<< "$patterns"
+
+if [ "$found" -eq 1 ]; then
+    echo "" >&2
+    echo "Commit aborted by hooks/commit-msg. Edit the commit message and try again." >&2
+    exit 1
+fi
+
+exit 0

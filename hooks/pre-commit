@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block commits whose staged diff contains any banned pattern.
+#
+# Patterns are read from .git-banned-patterns at the repo root, one per line.
+# Lines starting with `#` and blank lines are ignored. Matching is
+# case-insensitive substring (-i -F). The patterns file is gitignored, so
+# each developer maintains their own locally.
+#
+# To activate on a fresh clone:
+#   git config core.hooksPath hooks
+#
+# To bypass intentionally (rare): git commit --no-verify
+# (but per project policy, don't skip hooks without a stated reason).
+
+set -euo pipefail
+
+PATTERNS_FILE=".git-banned-patterns"
+
+if [ ! -f "$PATTERNS_FILE" ]; then
+    echo "pre-commit: $PATTERNS_FILE not found, skipping pattern check." >&2
+    echo "  (Copy .git-banned-patterns.example and fill in to enable.)" >&2
+    exit 0
+fi
+
+patterns=$(grep -v -E '^\s*$|^\s*#' "$PATTERNS_FILE" || true)
+if [ -z "$patterns" ]; then
+    exit 0
+fi
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+found=0
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    [ ! -f "$file" ] && continue
+    while IFS= read -r pattern; do
+        [ -z "$pattern" ] && continue
+        if git diff --cached -- "$file" | grep -i -F -- "$pattern" >/dev/null 2>&1; then
+            echo "pre-commit ERROR: banned pattern '$pattern' found in $file" >&2
+            found=1
+        fi
+    done <<< "$patterns"
+done <<< "$staged"
+
+if [ "$found" -eq 1 ]; then
+    echo "" >&2
+    echo "Commit aborted by hooks/pre-commit. Remove the banned pattern, then re-commit." >&2
+    exit 1
+fi
+
+exit 0

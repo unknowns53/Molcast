@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     OPSIN_JAR_PATH: str = "/opt/opsin/opsin.jar"
     OPSIN_WEB_URL: str = "https://opsin.ch.cam.ac.uk/opsin/"
 
+    # Phase 3 two-stage flow (Cloud Tasks). Empty defaults let local
+    # development / unit tests boot without GCP credentials; the
+    # /slack/mol name: branch refuses to run when TASKS_QUEUE_ID,
+    # TASKS_PROJECT_ID, or TASKS_INVOKER_SA are blank.
+    TASKS_QUEUE_ID: str = ""
+    TASKS_LOCATION: str = "asia-northeast1"
+    TASKS_PROJECT_ID: str = ""
+    TASKS_INVOKER_SA: str = ""
+    INTERNAL_PROCESS_PATH: str = "/internal/process"
+    IDEMPOTENCY_COLLECTION: str = "molecules_idempotency"
+    IDEMPOTENCY_TTL_SECONDS: int = 3600
+
     LOG_LEVEL: str = "INFO"
     PORT: int = 8080
 

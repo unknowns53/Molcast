@@ -52,6 +52,9 @@ storage.db
 *.sqlite3
 fixtures/local/
 
+# --- Local-dev render output (dev/render_viewer_sample.py default dir) ---
+dev/_renders/
+
 # --- Pre-commit banned patterns (per-developer, never committed) ---
 .git-banned-patterns
 

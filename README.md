@@ -49,6 +49,13 @@
 | `OPSIN_BACKEND` | no | `local` | Phase 3: `local` / `local_only` / `web` |
 | `OPSIN_JAR_PATH` | no | `/opt/opsin/opsin.jar` | Phase 3 のフォールバックパス |
 | `OPSIN_WEB_URL` | no | `https://opsin.ch.cam.ac.uk/opsin/` | Phase 3 の EBI エンドポイント |
+| `TASKS_PROJECT_ID` | name: 経路で必須 | 空 | Phase 3 二段フロー: Cloud Tasks queue を持つ GCP プロジェクト |
+| `TASKS_QUEUE_ID` | name: 経路で必須 | 空 | 例: `molcast-name-resolution` |
+| `TASKS_LOCATION` | no | `asia-northeast1` | Cloud Run と同一リージョン |
+| `TASKS_INVOKER_SA` | name: 経路で必須 | 空 | Cloud Tasks が OIDC token を発行する SA |
+| `INTERNAL_PROCESS_PATH` | no | `/internal/process` | Cloud Tasks が叩く内部エンドポイント |
+| `IDEMPOTENCY_COLLECTION` | no | `molecules_idempotency` | Cloud Tasks at-least-once 配信のデデュープ用 |
+| `IDEMPOTENCY_TTL_SECONDS` | no | `3600` | 同上、TTL ポリシーで自動 expire させたい場合の参考値 |
 | `LOG_LEVEL` | no | `INFO` | Python `logging` のレベル |
 | `PORT` | — | Cloud Run が注入 | Uvicorn のバインドポート |
 
@@ -100,7 +107,7 @@ sudo apt install default-jre-headless
 # Windows: Temurin を https://adoptium.net/ からダウンロード
 ```
 
-`tests/test_opsin_utils.py` は `subprocess.run` と `httpx.get` を mock するので、CI / 通常開発では JRE 不要 (alias JSON の RDKit round-trip 検証は走る)。
+`tests/test_opsin_utils.py` は `subprocess.run` と `httpx.get` を mock するので、CI / 通常開発では JRE 不要 (alias JSON の RDKit round-trip 検証は走る)。同様に `tests/test_main.py`, `tests/test_tasks_dispatch.py`, `tests/test_oidc_verify.py` も Cloud Tasks クライアントと OIDC 検証を mock するので、ローカル開発で GCP クレデンシャルや `gcloud auth` は要らない。Cloud Tasks 経由の二段フローを実機で確認したいときだけ `DEPLOY.md §5.6` の手順で Queue / SA を作成する。
 
 ## 7. Docker ビルド
 
@@ -178,7 +185,9 @@ docker run --rm -p 8080:8080 \
   → 使い方: /mol <SMILES> ...
     座標ファイルを描画するには https://<service>/view/ を ...
 
-# Phase 3 (name: 経路)
+# Phase 3 (name: 経路、Cloud Tasks 二段化)
+# まず即時 ack「処理中です... 完了したら結果を投稿します。」が ephemeral で表示され、
+# その後に下記が response_url 経由で後追い投稿される。
 /mol name: ethanol
   → 3D viewer generated: https://<service>/view/abcd...   # alias hit (CCO)
 /mol name: DMSO
@@ -186,7 +195,7 @@ docker run --rm -p 8080:8080 \
 /mol name: 4-vinylpyridine
   → 3D viewer generated: ...                              # alias hit (C=Cc1ccncc1)
 /mol name: hexafluorobenzene
-  → 3D viewer generated: ...                              # OPSIN local 解決
+  → 3D viewer generated: ...                              # OPSIN local 解決 (~5-15 秒)
 /mol name: メタノール
   → 3D viewer generated: ...                              # alias hit (CO)、kana 経路
 /mol name: not_a_real_compound
@@ -204,7 +213,16 @@ obabel input.cif -O output.xyz
 
 ### Slack ハンドラのフロー
 
-Phase 1 は `/slack/mol` を**同期処理**で完結させている。設計ブリーフ §5.2 の「ack 即返 + `response_url` 後追い」二段フローは Cloud Run の `cpu-throttling=always` (デフォルト) と相性が悪く、ack 返却直後に CPU が絞られて `BackgroundTasks` が事実上停止するため。同期 1 パスにすれば cpu-throttling のデフォルト挙動 (アイドル時 0 課金) を維持できる。Phase 3 で OPSIN の JVM 起動コストが 3 秒制約を圧迫し始めたら二段フローを再導入する想定で、`app/slack_dispatch.py` は温存している。
+経路ごとに 2 種類:
+
+- **SMILES 経路**: `/slack/mol` を**同期処理**で完結 (Phase 1 で実証)。RDKit embed + Firestore で 3 秒 ack 窓内に収まる。
+- **`name:` 経路**: **二段フロー** (Phase 3 で導入)。`/slack/mol` で Cloud Tasks に enqueue + ack 即返 (「処理中です...」) → `/internal/process` を Cloud Tasks が OIDC token 付きで叩く → OPSIN + RDKit + Firestore + Slack `response_url` POST。
+
+Cloud Run の `cpu-throttling=always` (デフォルト) は FastAPI の `BackgroundTasks` を ack 返却直後に絞ってしまうため、ack 後の重い処理は同一インスタンス内では実行できない。`name:` 経路の OPSIN local backend は JVM 起動 (`java -jar` を毎回起動) で 1-2 秒のオーバーヘッドが恒常的に乗るので、3 秒 ack 内に収めるのは無理がある。そこで Cloud Tasks にタスクを「投げ直す」形で同一インスタンスを再度のリクエストとして起こす。これなら cpu-throttling=always を維持したまま (アイドル時 0 課金) 重い処理を許容できる。
+
+重複処理対策は二段防衛: (a) Cloud Tasks の deterministic task name (`sha256(response_url)`) で Slack のスラッシュコマンドリトライを CT 側で弾く、(b) Firestore `molecules_idempotency` コレクションへの `create()` で CT の at-least-once 内部リトライ (worker クラッシュ後など) を弾く。
+
+Cloud Tasks のセットアップは `DEPLOY.md §5.6` 参照。Queue 作成 + invoker SA 作成 + CT P4SA から invoker SA への `serviceAccountTokenCreator` 付与 + invoker SA への Cloud Run `roles/run.invoker` 付与 + 環境変数の設定の 5 ステップ。
 
 ### コールドスタート
 

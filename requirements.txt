@@ -12,3 +12,10 @@ pydantic-settings>=2.2,<3.0
 # it via subprocess directly to get a real timeout (the py2opsin Python
 # API has no per-call timeout). See app/opsin_utils.py:_resolve_jar_path.
 py2opsin>=1.0.1
+
+# Phase 3 two-stage flow. /slack/mol enqueues a Cloud Tasks job, returns
+# ack within Slack's 3 s window, and /internal/process consumes the
+# task (OIDC-authenticated) to run OPSIN + RDKit + Firestore, then POSTs
+# the result to Slack's response_url. google-auth ships transitively
+# and is also reused for /internal/process OIDC verification.
+google-cloud-tasks>=2.16,<3.0

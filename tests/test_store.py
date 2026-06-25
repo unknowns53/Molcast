@@ -24,10 +24,20 @@ class _FakeSnapshot:
 class _FakeDocument:
     def __init__(self):
         self.set_calls: list[dict] = []
+        self.create_calls: list[dict] = []
         self._snapshot: _FakeSnapshot = _FakeSnapshot(None)
+        self._exists_for_create: bool = False
 
     def set(self, data: dict) -> None:
         self.set_calls.append(data)
+
+    def create(self, data: dict) -> None:
+        from google.api_core import exceptions as gax
+
+        if self._exists_for_create:
+            raise gax.AlreadyExists("doc already exists")
+        self._exists_for_create = True
+        self.create_calls.append(data)
 
     def get(self) -> _FakeSnapshot:
         return self._snapshot
@@ -134,3 +144,34 @@ def test_naive_expires_at_treated_as_utc():
     with mock.patch.object(store, "_client", return_value=fake):
         out = store.get_molecule("abc", collection="molecules")
     assert out == {"expired": True}
+
+
+def test_claim_idempotency_key_first_call_returns_true():
+    fake = _FakeClient()
+    with mock.patch.object(store, "_client", return_value=fake):
+        ok = store.claim_idempotency_key(
+            "abc123", collection="molecules_idempotency", ttl_seconds=3600
+        )
+    assert ok is True
+    doc = fake.collections["molecules_idempotency"].docs["abc123"]
+    assert len(doc.create_calls) == 1
+    record = doc.create_calls[0]
+    assert record["key"] == "abc123"
+    delta = record["expires_at"] - record["claimed_at"]
+    assert abs(delta - _dt.timedelta(seconds=3600)) < _dt.timedelta(seconds=1)
+
+
+def test_claim_idempotency_key_second_call_returns_false():
+    fake = _FakeClient()
+    with mock.patch.object(store, "_client", return_value=fake):
+        first = store.claim_idempotency_key(
+            "abc123", collection="molecules_idempotency", ttl_seconds=3600
+        )
+        second = store.claim_idempotency_key(
+            "abc123", collection="molecules_idempotency", ttl_seconds=3600
+        )
+    assert first is True
+    assert second is False
+    # Only the first claim persisted.
+    doc = fake.collections["molecules_idempotency"].docs["abc123"]
+    assert len(doc.create_calls) == 1

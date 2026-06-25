@@ -1,0 +1,12 @@
+# Phase 1 runtime
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+google-cloud-firestore>=2.16,<3.0
+python-multipart>=0.0.9
+httpx>=0.27,<1.0
+rdkit>=2024.3.1
+pydantic-settings>=2.2,<3.0
+
+# Phase 3 (kept here so the image rebuild path for Phase 3 is a no-op).
+# Imports are deferred until app/opsin_utils.py is added.
+py2opsin>=1.0.1

@@ -1,0 +1,33 @@
+# §11.1 exclusions. The runtime image only needs `app/`, `requirements.txt`,
+# and the Dockerfile itself.
+.git/
+.gitignore
+.gitattributes
+.git-banned-patterns
+.git-banned-patterns.example
+hooks/
+
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+
+.env
+.env.example
+.env.*
+
+.vscode/
+.idea/
+
+README.md
+deploy.sh
+Slack_*.md
+
+.claude/
+*.log

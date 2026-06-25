@@ -58,6 +58,8 @@
 | `IDEMPOTENCY_TTL_SECONDS` | no | `3600` | 同上、TTL ポリシーで自動 expire させたい場合の参考値 |
 | `LOG_LEVEL` | no | `INFO` | Python `logging` のレベル |
 | `PORT` | — | Cloud Run が注入 | Uvicorn のバインドポート |
+| `DEV_SKIP_SIGNATURE_VERIFICATION` | no | `false` | ローカル開発専用。`/slack/mol` の Slack 署名検証をスキップ。**Cloud Run には絶対に設定しない** |
+| `DEV_INLINE_NAME_RESOLUTION` | no | `false` | ローカル開発専用。`name:` 経路を Cloud Tasks ではなくバックグラウンドスレッドで inline 実行。**Cloud Run には絶対に設定しない** |
 
 `EMBED_MAX_RETRIES` は意図的に外に出していない。各試行は独自の ETKDGv3 パラメータセットを使うため、埋め込み再試行回数は 3 回で固定している (`app/rdkit_utils.py` および設計ブリーフ §6.1 を参照)。
 
@@ -88,6 +90,53 @@ uvicorn app.main:app --reload
 ```
 
 Windows での `rdkit`: Python 3.11 の pip wheel は動作する (Docker イメージのランタイムと合わせている)。pip install が手元の環境で失敗するなら、Cloud Run のビルド経路 (`gcloud run deploy --source .`) が動作する環境を作る正規ルート。
+
+### HTTPS トンネル経由で Slack から実機テスト (UX 磨きの開発ループ)
+
+文言・viewer 装飾・alias 追加など軽い iteration のために `gcloud run deploy` (1 サイクル 5-8 分) を毎回叩いていると磨きが進まない。`uvicorn --reload` + HTTPS トンネル + 2 つの dev フラグで、ローカル uvicorn を Slack のスラッシュコマンドから秒で叩ける形にできる。
+
+**準備**
+
+`.env` に dev フラグを足す (`.env` は gitignore 済み):
+
+```
+DEV_SKIP_SIGNATURE_VERIFICATION=true
+DEV_INLINE_NAME_RESOLUTION=true
+OPSIN_BACKEND=web        # JRE をローカルに入れないなら web 経由が楽
+SLACK_RESPONSE_TYPE=ephemeral
+BASE_URL=                # トンネル URL は起動時に決まるので空でよい (リクエストから取得)
+```
+
+**手順**
+
+1. uvicorn をローカルで起動 (リクエスト毎に reload):
+
+   ```powershell
+   .venv\Scripts\activate
+   uvicorn app.main:app --reload --host 127.0.0.1 --port 8080
+   ```
+
+   起動ログに `dev_flags_active` の WARNING が出ているのを確認 (出ていなければフラグが効いていない)。
+
+2. 別シェルで cloudflared で HTTPS トンネルを張る (cloudflared インストール: <https://github.com/cloudflare/cloudflared/releases> の Windows バイナリを PATH に置く):
+
+   ```powershell
+   cloudflared tunnel --url http://localhost:8080
+   ```
+
+   ターミナルに `https://<random>.trycloudflare.com` の URL が出る。サインアップ不要の quick tunnel。
+
+3. Slack App の **Slash Commands → /mol** を編集し、*Request URL* を `https://<random>.trycloudflare.com/slack/mol` に一時的に書き換える。Save。Slack 側の再インストールは不要。
+
+4. Slack から `/mol CCO` や `/mol name: DMSO` を投げると、ローカル uvicorn でハンドルされる。`app/*.py` を編集して保存すると uvicorn が即 reload するので、次のリクエストは新しいコードで処理される。
+
+5. テストが終わったら Slack の Request URL を本番 (`https://mol-slack-viewer-...run.app/slack/mol`) に戻す。
+
+**caveat**
+
+- 同じ Slack ワークスペースの他者が `/mol` を使いたい時間帯はこの手順を避ける (Request URL が一時的に自分のローカルを向いているため)。磨き専用の Slack ワークスペースを別途用意するのが安全。
+- Firestore は本物 (asia-northeast1 のプロジェクト) に書き込みに行くので、ローカルで生成した分子も本番の `molecules` コレクションに残る。気になるなら Firestore エミュレータを並走 (§5 の手順) + `FIRESTORE_EMULATOR_HOST` を設定。
+- `DEV_*` フラグは Cloud Run 側の env vars には**絶対に**含めない (`gcloud run deploy --set-env-vars` に書かない)。本番に紛れ込むと署名検証や Cloud Tasks が崩れる。`deploy.sh` も `DEV_*` を含まない設計。
 
 ## 6. `name:` 経路 (Phase 3) のローカル開発
 

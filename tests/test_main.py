@@ -306,3 +306,101 @@ def test_internal_process_opsin_user_error_posts_error_to_slack_204(client):
     assert mpost.call_count == 1
     _, posted_payload = mpost.call_args.args
     assert "OPSIN" in posted_payload["text"]
+
+
+# ---------------------------------------------------------------------------
+# Local-dev flags (DEV_SKIP_SIGNATURE_VERIFICATION, DEV_INLINE_NAME_RESOLUTION)
+# ---------------------------------------------------------------------------
+def test_slack_mol_skips_signature_when_dev_flag_set(client, monkeypatch):
+    """With DEV_SKIP_SIGNATURE_VERIFICATION=true, /slack/mol must accept
+    requests that carry no signature header (or a wrong one). This is
+    the local-dev path — tunnel + curl + Slack-without-prod-secret.
+    """
+    monkeypatch.setenv("DEV_SKIP_SIGNATURE_VERIFICATION", "true")
+    from app.config import reload_settings
+
+    reload_settings()
+    fake_payload = {
+        "response_type": "ephemeral",
+        "replace_original": False,
+        "text": "3D viewer generated: https://x/view/abc",
+    }
+    with mock.patch.object(app_main, "verify_slack_request") as mverify, \
+         mock.patch.object(
+            app_main, "_process_smiles_sync", return_value=fake_payload
+         ):
+        # No signature headers; in prod this would be 403.
+        resp = client.post(
+            "/slack/mol",
+            data={"text": "CCO", "user_id": "U1", "channel_id": "C1"},
+        )
+    assert resp.status_code == 200
+    assert resp.json() == fake_payload
+    # verify_slack_request must NOT have been called at all when the
+    # flag is on — short-circuit before HMAC work.
+    assert mverify.call_count == 0
+
+
+def test_slack_mol_enforces_signature_when_dev_flag_unset(client):
+    """Regression: with the flag at its False default, /slack/mol still
+    enforces signature verification (this is the prod path).
+    """
+    # The autouse fixture does not set DEV_SKIP_SIGNATURE_VERIFICATION,
+    # so it defaults to False. Send a request with no/wrong signature
+    # and patch verify_slack_request to return False.
+    with mock.patch.object(app_main, "verify_slack_request", return_value=False):
+        resp = client.post(
+            "/slack/mol",
+            data={"text": "CCO", "user_id": "U1", "channel_id": "C1"},
+        )
+    assert resp.status_code == 403
+
+
+def test_slack_mol_name_uses_dev_dispatch_when_inline_flag_set(client, monkeypatch):
+    """With DEV_INLINE_NAME_RESOLUTION=true, the name: branch must route
+    through dev_dispatch.run_inline_name_resolution, NOT
+    tasks_dispatch.enqueue_name_resolution. Cloud Tasks is unavailable
+    in dev so the prod path would fail with TasksConfigError.
+    """
+    monkeypatch.setenv("DEV_INLINE_NAME_RESOLUTION", "true")
+    from app.config import reload_settings
+
+    reload_settings()
+    with mock.patch.object(app_main, "verify_slack_request", return_value=True), \
+         mock.patch.object(
+            app_main.dev_dispatch,
+            "run_inline_name_resolution",
+            return_value="dev-inline-task/abc",
+         ) as minline, \
+         mock.patch.object(
+            app_main.tasks_dispatch, "enqueue_name_resolution"
+         ) as menq:
+        resp = client.post("/slack/mol", data=_name_form())
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert "処理中" in payload["text"]
+    assert minline.call_count == 1
+    assert menq.call_count == 0
+    kwargs = minline.call_args.kwargs
+    assert kwargs["name"] == "hexafluorobenzene"
+    assert kwargs["response_url"] == _RESPONSE_URL
+    assert kwargs["base_url"] == _BASE_URL
+
+
+def test_slack_mol_name_uses_tasks_dispatch_when_inline_flag_unset(client):
+    """Regression: with the flag False (autouse default), the name: branch
+    goes through Cloud Tasks, not the dev inline path.
+    """
+    with mock.patch.object(app_main, "verify_slack_request", return_value=True), \
+         mock.patch.object(
+            app_main.tasks_dispatch,
+            "enqueue_name_resolution",
+            return_value="projects/p/locations/l/queues/q/tasks/abc",
+         ) as menq, \
+         mock.patch.object(
+            app_main.dev_dispatch, "run_inline_name_resolution"
+         ) as minline:
+        resp = client.post("/slack/mol", data=_name_form())
+    assert resp.status_code == 200
+    assert menq.call_count == 1
+    assert minline.call_count == 0

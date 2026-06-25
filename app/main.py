@@ -33,7 +33,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from . import slack_dispatch, store, tasks_dispatch, templates
+from . import dev_dispatch, slack_dispatch, store, tasks_dispatch, templates
 from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .oidc_verify import OIDCVerificationError, verify_oidc_token
@@ -50,6 +50,20 @@ async def _lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(level=settings.LOG_LEVEL)
     logger.info("startup", extra={"backend": settings.OPSIN_BACKEND})
+    # Surface dev-only bypasses at WARNING so a misconfigured prod deploy
+    # is obvious from a single log line. Both flags default False; either
+    # being True is intentional in local dev only.
+    if (
+        settings.DEV_SKIP_SIGNATURE_VERIFICATION
+        or settings.DEV_INLINE_NAME_RESOLUTION
+    ):
+        logger.warning(
+            "dev_flags_active",
+            extra={
+                "skip_signature": settings.DEV_SKIP_SIGNATURE_VERIFICATION,
+                "inline_name": settings.DEV_INLINE_NAME_RESOLUTION,
+            },
+        )
     yield
 
 
@@ -189,7 +203,12 @@ async def slack_mol(request: Request) -> JSONResponse:
 
     timestamp = request.headers.get("X-Slack-Request-Timestamp", "")
     signature = request.headers.get("X-Slack-Signature", "")
-    if not verify_slack_request(
+    if settings.DEV_SKIP_SIGNATURE_VERIFICATION:
+        # Local-dev: signature verification is bypassed. The startup
+        # WARNING log surfaces this state; per-request logging would be
+        # too noisy.
+        pass
+    elif not verify_slack_request(
         settings.SLACK_SIGNING_SECRET, timestamp, signature, body
     ):
         # Do not echo the body or the offending header — just refuse.
@@ -233,14 +252,28 @@ async def slack_mol(request: Request) -> JSONResponse:
                 )
             )
         try:
-            task_name = tasks_dispatch.enqueue_name_resolution(
-                name=payload,
-                response_url=response_url,
-                user_id=user_id,
-                channel_id=channel_id,
-                base_url=base_url,
-                settings=settings,
-            )
+            if settings.DEV_INLINE_NAME_RESOLUTION:
+                # Local-dev: run OPSIN + RDKit + Firestore + Slack POST
+                # inline (in a daemon thread) instead of enqueueing to
+                # Cloud Tasks. Returns immediately so the 3 s ack
+                # window is not stressed.
+                task_name = dev_dispatch.run_inline_name_resolution(
+                    name=payload,
+                    response_url=response_url,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    base_url=base_url,
+                    settings=settings,
+                )
+            else:
+                task_name = tasks_dispatch.enqueue_name_resolution(
+                    name=payload,
+                    response_url=response_url,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                    base_url=base_url,
+                    settings=settings,
+                )
         except TasksConfigError as exc:
             logger.exception(
                 "tasks_config_error",

@@ -1,0 +1,55 @@
+# Cloud Build pipeline for the Molcast image.
+#
+# Uses `docker build --cache-from <prev image>` so layers whose inputs
+# have not changed (apt install, pip install -r requirements.txt) are
+# pulled from the previously published image instead of rebuilt. On a
+# pure app/ edit this collapses a 5-8 min Cloud Build into ~1-2 min.
+#
+# First build (or any build where the prior image was deleted) falls
+# through cleanly: `docker pull ... || echo` tolerates the miss and the
+# build proceeds from scratch.
+#
+# Pairs with the Artifact Registry repo that `gcloud run deploy
+# --source .` populated the first time, so cleanup-policy.json
+# (keep-most-recent-1) continues to apply without change.
+
+substitutions:
+  _REGION: asia-northeast1
+  _REPO: cloud-run-source-deploy
+  _IMAGE: mol-slack-viewer
+
+steps:
+  # 1. Best-effort pull of the previous "latest" so docker has its
+  #    layers available locally for --cache-from. The `|| echo` lets
+  #    the very first build (no prior image) proceed without failing.
+  - name: gcr.io/cloud-builders/docker
+    id: pull-cache
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        docker pull ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest \
+            || echo "no prior image; building without cache"
+
+  # 2. Build with --cache-from. Docker reuses the apt + pip layers when
+  #    requirements.txt and the Dockerfile lines above COPY app/ are
+  #    unchanged, and only re-runs from `COPY app/ ./app/` onward.
+  - name: gcr.io/cloud-builders/docker
+    id: build
+    args:
+      - build
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+      - --tag
+      - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+      - .
+
+# Cloud Build pushes everything in `images` to its registry after the
+# build steps succeed. Cleanup-policy.json on the destination repo
+# evicts the previous "latest" once this push lands.
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:latest
+
+# 20 min: comfortable headroom for a no-cache full build (apt + pip
+# install RDKit etc. + push) on the default Cloud Build machine type.
+timeout: 1200s

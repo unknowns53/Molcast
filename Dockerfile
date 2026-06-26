@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # Phase 3 image: RDKit + OPSIN. `default-jre-headless` is required at
 # runtime by `app/opsin_utils.py:_call_local`, which invokes the OPSIN
 # CLI JAR shipped inside the py2opsin wheel via `subprocess.run`.
@@ -7,6 +5,14 @@
 # desktop bundle pulled in by `default-jre`. Measure the resulting
 # image size before claiming it (see Artifact Registry cleanup note in
 # DEPLOY.md §5.5).
+#
+# The Cloud Build pipeline (cloudbuild.yaml) uses the legacy (non-
+# BuildKit) `gcr.io/cloud-builders/docker` daemon, so no BuildKit
+# parser directive sits at the top of this file. If you ever need
+# BuildKit features (e.g. `RUN --mount=type=cache`), restore the
+# `# syntax=docker/dockerfile:1` line AND switch cloudbuild.yaml's
+# docker step to set `DOCKER_BUILDKIT=1` and pass
+# `--build-arg BUILDKIT_INLINE_CACHE=1`.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \

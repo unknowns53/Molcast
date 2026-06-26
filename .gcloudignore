@@ -1,0 +1,51 @@
+# Cloud Build upload exclusions. Mirrors .dockerignore so the build
+# context uploaded to Cloud Build matches the COPY scope inside the
+# Dockerfile. Without this file, gcloud auto-generates one from
+# .gitignore on first `gcloud builds submit` run; the auto-generated
+# version is broader than necessary and silently shows up as an
+# untracked file in the working tree.
+#
+# Anything excluded here is NOT shipped to Cloud Build, which speeds
+# the upload step (and keeps secrets like .env out of the build tarball
+# even if .gitignore is loose).
+
+.git/
+.gitignore
+.gitattributes
+.git-banned-patterns
+.git-banned-patterns.example
+hooks/
+
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.venv/
+venv/
+env/
+
+.env
+.env.example
+.env.*
+
+.vscode/
+.idea/
+
+README.md
+DEPLOY.md
+deploy.sh
+Slack_*.md
+
+.claude/
+*.log
+
+# Cloud Build itself reads cloudbuild.yaml via --config; it does not
+# need to ride along in the build tarball.
+cloudbuild.yaml
+
+# AR cleanup policy is an out-of-band gcloud artifacts call; no build
+# step references it.
+cleanup-policy.json

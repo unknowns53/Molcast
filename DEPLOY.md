@@ -301,6 +301,54 @@ gcloud tasks list --queue=molcast-name-resolution `
 
 待機中タスクが残っていれば dispatch が失敗している (OIDC / IAM のいずれかが未設定)。`gcloud run services logs read` で `oidc_*` / `idempotency_*` / `internal_process_*` の構造化ログを追う。
 
+## 5.7. 再デプロイの高速化 (cloudbuild.yaml + `--cache-from`)
+
+§5 の `gcloud run deploy --source .` は毎回 Cloud Build を空の Docker daemon でゼロから走らせるため、apt + pip install (RDKit) を毎回フルに繰り返して **build step 単体で 5-8 分** かかる。日々の文言・viewer 微修正 (Phase 1 + Phase 3 で大きな依存追加が落ち着いた後) なら、`--cache-from` で前回イメージのレイヤを再利用するパイプラインに切り替えると **build step は 1-2 分**、Cloud Build worker spin-up + Cloud Run rollout を含めた **end-to-end は 3-4 分** に落ちる。
+
+(`gcloud builds list` の `DURATION` は worker spin-up を含むので、目に見えるのは end-to-end 値。「1-2 分」を期待すると体感とズレる)
+
+リポジトリに同梱されている `cloudbuild.yaml` がそのパイプライン。中身は 3 ステップ:
+
+1. `docker pull <prev image> || echo "..."` — 既存の `:latest` を引いてキャッシュ層をローカルに乗せる。初回 / イメージ消失時は空打ちで素通り
+2. `docker build --cache-from <prev image>` — Dockerfile と `requirements.txt` が無変更なら apt + pip 層を再利用、`COPY app/` 以降だけ再構築
+3. `images:` で AR に push (Cloud Build の組み込み機構)
+
+呼び出しは `deploy.sh` が 2 段で済むようになっている (Windows では Git Bash か WSL から、または `bash ./deploy.sh` で叩く):
+
+```bash
+PROJECT_ID=molcast-XXX-001 bash ./deploy.sh
+```
+
+実体は
+
+```powershell
+gcloud builds submit --project=$env:PROJECT_ID --config=cloudbuild.yaml `
+    --substitutions=_REGION=asia-northeast1,_REPO=cloud-run-source-deploy,_IMAGE=mol-slack-viewer
+
+gcloud run deploy mol-slack-viewer --image=<上で push した URI> ...
+```
+
+`--image` を渡すと Cloud Run は再ビルドせず AR の image を直接デプロイするので、cache の効いた build がそのまま反映される。`--source .` を再度叩いてしまうと Cloud Run 側でキャッシュ無しの 2 回目のビルドが走ってしまうので注意。
+
+deploy.sh の env 更新は `--update-env-vars` (merge) を使っているので、Phase 3 で刺さっている `TASKS_*` / `BASE_URL` 等は保持される (`--set-env-vars` の REPLACE 挙動だと全消しになる踏み外しがあったので明示的に merge にしている)。
+
+### いつ使うか
+
+- **初回 (本ファイル §5 を初めて通すとき)**: `--source .` の方を使う。AR repo `cloud-run-source-deploy` が未作成の段階で `gcloud builds submit` を走らせると push 先が無いので失敗する。`--source .` 側は自動で repo を作る
+- **2 回目以降の再デプロイ**: `cloudbuild.yaml` 経由 (`bash ./deploy.sh` または `gcloud builds submit + gcloud run deploy --image`) に切り替える
+- **依存を変えた直後 (`requirements.txt` 修正、Dockerfile 改修)**: cache miss するので `--cache-from` パイプラインでも build step が 5-8 分に戻る。これは仕様
+- **前回デプロイから 24 時間以上空けた後**: cleanup-policy + AR の blob GC で前回 `:latest` の untagged 過去履歴が消えてしまっていることがあり、`docker pull` 自体は :latest を引けるので cache hit するが、過去の中間 manifest が消えていれば一部 cache miss する。連投が連投を呼ぶフェーズでは 1-2 分、寝かせた後は数分余計、と読む
+
+### 速度比較の計測
+
+cache 有無の差を測るには、Cloud Build コンソールの各ビルドのタイミングを比較するのが手早い:
+
+```powershell
+gcloud builds list --project=$env:PROJECT_ID --limit=5
+```
+
+`DURATION` 列に "5m 32s" → "1m 18s" のような変化が見えれば cache が効いている (上記の通り worker spin-up 込み)。
+
 ## 6. Slack slash command を Cloud Run に向ける
 
 <https://api.slack.com/apps> に戻り、Molcast app を開く:

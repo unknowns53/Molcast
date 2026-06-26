@@ -323,6 +323,7 @@ PROJECT_ID=molcast-XXX-001 bash ./deploy.sh
 
 ```powershell
 gcloud builds submit --project=$env:PROJECT_ID --config=cloudbuild.yaml `
+    --region=asia-northeast1 `
     --substitutions=_REGION=asia-northeast1,_REPO=cloud-run-source-deploy,_IMAGE=mol-slack-viewer
 
 gcloud run deploy mol-slack-viewer --image=<上で push した URI> ...
@@ -331,6 +332,21 @@ gcloud run deploy mol-slack-viewer --image=<上で push した URI> ...
 `--image` を渡すと Cloud Run は再ビルドせず AR の image を直接デプロイするので、cache の効いた build がそのまま反映される。`--source .` を再度叩いてしまうと Cloud Run 側でキャッシュ無しの 2 回目のビルドが走ってしまうので注意。
 
 deploy.sh の env 更新は `--update-env-vars` (merge) を使っているので、Phase 3 で刺さっている `TASKS_*` / `BASE_URL` 等は保持される (`--set-env-vars` の REPLACE 挙動だと全消しになる踏み外しがあったので明示的に merge にしている)。
+
+### worker pool は AR と同 region に揃える
+
+`gcloud builds submit` に `--region=asia-northeast1` を渡し、Cloud Build worker を AR repo と同じリージョンで走らせている。省略すると default global pool (実体は us-central1) で走り、毎ビルドで以下の region 跨ぎ転送が発生する:
+
+- `docker pull <prev image>` — Asia AR → US worker (cache-from 用、~516 MB)
+- `docker push <new image>` — US worker → Asia AR
+
+Cloud Run と AR は asia-northeast1 で揃っているので、Cloud Build だけが US だと逆方向にトラフィックが流れる構図になる。`asia-northeast1` 指定でこの **image bytes (~500 MB) の両方向 egress** を解消する。
+
+source staging bucket は既存の `gs://<PROJECT_ID>_cloudbuild` (US) のまま使われる。`gcloud builds submit` のデフォルト挙動では `--region=asia-northeast1` を渡しても source upload 先は変わらず、`--default-buckets-behavior=REGIONAL_USER_OWNED_BUCKET` を併せて渡したときだけ `gs://<PROJECT_ID>_<REGION>_cloudbuild` が auto-create される。
+
+source tarball は数十〜数百 KB と小さく、worker (asia-northeast1) が US bucket から download する cross-region 転送は **1 build あたり 10⁻⁵ USD オーダーで無視できる**。主目的は image bytes の region 跨ぎ解消で、それは `--region` 単体で達成されている。完全に asia 内に閉じたいなら上記フラグ追加だが、課金影響が桁違いに小さく deploy.sh では採用していない。
+
+旧 US bucket `gs://<PROJECT_ID>_cloudbuild` は **削除しない** (今も source upload に使われている)。
 
 ### いつ使うか
 

@@ -48,12 +48,24 @@ if [ "$PROJECT_ID" = "CHANGE_ME" ]; then
 fi
 
 # Step 1: Build via Cloud Build with --cache-from (cloudbuild.yaml).
+# --region: run the build worker in the same region as the AR repo
+# (asia-northeast1). The default global pool runs in us-central1, which
+# means every `docker pull <prev image>` and `docker push <new image>`
+# crosses Asia <-> US and bills cross-region egress. Regional execution
+# keeps those image bytes (~500 MB) inside asia-northeast1.
+# Source staging bucket: stays as gs://<PROJECT_ID>_cloudbuild (US) by
+# default; gcloud only switches to gs://<PROJECT_ID>_<REGION>_cloudbuild
+# when --default-buckets-behavior=REGIONAL_USER_OWNED_BUCKET is also
+# passed. The per-build source tarball is small (~100 KB) so the
+# remaining cross-region download is negligible (~1e-5 USD/build), and
+# the legacy US bucket must be kept (do NOT delete it).
 # --suppress-logs: skip log streaming. Some accounts hit "Viewer/Owner"
 # streaming permission errors even with Owner role; suppressing the
 # stream sidesteps the check. Build output stays in the Cloud Build
 # console.
 gcloud builds submit \
     --project "$PROJECT_ID" \
+    --region "$REGION" \
     --config cloudbuild.yaml \
     --substitutions "_REGION=${REGION},_REPO=${AR_REPO},_IMAGE=${SERVICE_NAME}" \
     --suppress-logs

@@ -1,11 +1,11 @@
-r"""Cloud Tasks dispatch for the ``/mol name:`` two-stage flow (see §5.2,
-§8.2 of the design brief).
+r"""Cloud Tasks dispatch for the multi-segment ``/mol`` trajectory flow
+(see §5.2, §8.2 of the design brief).
 
 ``/slack/mol`` enqueues a task here, returns ack within Slack's 3 s
 window, and ``/internal/process`` consumes the task asynchronously. The
-task carries the ``response_url`` so the worker can post the final
-viewer URL (or an error message) back to Slack via
-``app.slack_dispatch.post_to_response_url``.
+task carries the parsed ``segments`` list AND the ``response_url`` so
+the worker can post the final viewer URL (or an error message) back to
+Slack via ``app.slack_dispatch.post_to_response_url``.
 
 Two design decisions worth restating:
 
@@ -69,7 +69,8 @@ def _idempotency_key(response_url: str) -> str:
 
 def _build_payload(
     *,
-    name: str,
+    segments: list[tuple[str, str]],
+    was_capped: bool,
     response_url: str,
     user_id: str | None,
     channel_id: str | None,
@@ -77,19 +78,18 @@ def _build_payload(
     idempotency_key: str,
     flags: dict[str, bool] | None = None,
 ) -> bytes:
-    """JSON payload for ``/internal/process``. Kept narrow on purpose —
-    every field is needed by the worker, and adding fields here is a
-    schema change that requires a coordinated rollout.
+    """JSON payload for ``/internal/process`` (schema v2).
 
-    ``flags`` carries the parsed ``--public`` / ``--label`` / ``--no-3d``
-    state from the slash command (#3). The worker reads it back as an
-    optional field; if missing the worker defaults to all-False, which
-    is backward-compatible with old in-flight tasks.
+    Segments are emitted as ``[{kind, payload}, ...]`` rather than a
+    plain string so the worker can distinguish ``smiles`` from ``name``
+    per element without re-parsing — the user's original token boundary
+    is the source of truth.
     """
     body: dict[str, Any] = {
-        "schema_version": 1,
-        "kind": "name",
-        "payload": name,
+        "schema_version": 2,
+        "kind": "trajectory",
+        "segments": [{"kind": k, "payload": p} for k, p in segments],
+        "was_capped": bool(was_capped),
         "response_url": response_url,
         "user_id": user_id,
         "channel_id": channel_id,
@@ -102,7 +102,8 @@ def _build_payload(
 
 def enqueue_name_resolution(
     *,
-    name: str,
+    segments: list[tuple[str, str]],
+    was_capped: bool,
     response_url: str,
     user_id: str | None,
     channel_id: str | None,
@@ -110,14 +111,13 @@ def enqueue_name_resolution(
     settings: Settings,
     flags: dict[str, bool] | None = None,
 ) -> str:
-    """Enqueue a name-resolution task. Returns the task name string
-    (so callers can log the resource identifier). Raises
+    """Enqueue a trajectory task. Returns the task name string (so
+    callers can log the resource identifier). Raises
     :class:`TasksConfigError` when required env settings are missing.
 
-    Cloud Tasks' ``AlreadyExists`` (raised when Slack retries the same
-    slash command and we hit our own deterministic task name) is logged
-    at INFO and swallowed — the first task is already enqueued and will
-    do the work.
+    Function name kept as ``enqueue_name_resolution`` for call-site
+    stability; semantically it now handles the full segment list (any
+    mix of ``smiles`` / ``name``).
     """
     if not settings.TASKS_PROJECT_ID:
         raise TasksConfigError("TASKS_PROJECT_ID is empty")
@@ -127,6 +127,8 @@ def enqueue_name_resolution(
         raise TasksConfigError("TASKS_INVOKER_SA is empty")
     if not base_url:
         raise TasksConfigError("base_url is empty")
+    if not segments:
+        raise TasksConfigError("segments is empty")
 
     client = _get_client()
     parent = client.queue_path(
@@ -148,7 +150,8 @@ def enqueue_name_resolution(
         url=target_url,
         headers={"Content-Type": "application/json"},
         body=_build_payload(
-            name=name,
+            segments=segments,
+            was_capped=was_capped,
             response_url=response_url,
             user_id=user_id,
             channel_id=channel_id,
@@ -174,6 +177,6 @@ def enqueue_name_resolution(
 
     logger.info(
         "tasks_enqueued",
-        extra={"input_name_len": len(name)},
+        extra={"segment_count": len(segments)},
     )
     return task_name

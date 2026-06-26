@@ -1,11 +1,11 @@
-"""End-to-end tests for the two-stage flow.
+"""End-to-end tests for the two-stage trajectory flow.
 
 Covers:
 
   * ``POST /slack/mol`` for the ``name:`` branch — Cloud Tasks enqueue
-    + ack-immediate.
-  * ``POST /internal/process`` — OIDC verify, idempotency, OPSIN +
-    RDKit + Firestore, ``response_url`` POST.
+    with the full segments list + ack-immediate.
+  * ``POST /internal/process`` — OIDC verify, schema v2 validation,
+    idempotency, OPSIN + RDKit + Firestore, ``response_url`` POST.
 
 All external integrations (Slack signature verification, Cloud Tasks
 client, Firestore, ``iupac_to_smiles``, ``post_to_response_url``) are
@@ -22,8 +22,6 @@ from fastapi.testclient import TestClient
 from app import main as app_main
 from app import oidc_verify, store
 from app.main import app
-from app.rdkit_utils import MoleculeGenerationError
-from app.tasks_dispatch import TasksConfigError
 
 
 _BASE_URL = "https://mol-slack-viewer-xxxxxxxx-an.a.run.app"
@@ -78,7 +76,8 @@ def test_slack_mol_name_enqueues_task_and_acks_immediately(client):
     assert "処理中" in payload["text"]
     assert menq.call_count == 1
     enq_kwargs = menq.call_args.kwargs
-    assert enq_kwargs["name"] == "hexafluorobenzene"
+    assert enq_kwargs["segments"] == [("name", "hexafluorobenzene")]
+    assert enq_kwargs["was_capped"] is False
     assert enq_kwargs["response_url"] == _RESPONSE_URL
     assert enq_kwargs["user_id"] == "U123"
     assert enq_kwargs["channel_id"] == "C456"
@@ -102,6 +101,8 @@ def test_slack_mol_name_without_response_url_returns_friendly_error(client):
 
 
 def test_slack_mol_name_tasks_config_error_returns_friendly_error(client):
+    from app.tasks_dispatch import TasksConfigError
+
     with mock.patch.object(app_main, "verify_slack_request", return_value=True), \
          mock.patch.object(
             app_main.tasks_dispatch,
@@ -117,18 +118,16 @@ def test_slack_mol_name_tasks_config_error_returns_friendly_error(client):
 # ---------------------------------------------------------------------------
 # /slack/mol — SMILES branch still sync (regression guard)
 # ---------------------------------------------------------------------------
-def test_slack_mol_smiles_path_still_runs_sync(client):
-    """SMILES route must not regress to two-stage; it still uses the
-    sync pipeline that Phase 1 verified fits in the 3 s window.
-    """
+def test_slack_mol_smiles_path_runs_sync_pipeline(client):
+    """SMILES-only routes must NOT enqueue a task — they run inline."""
     fake_payload = {
         "response_type": "ephemeral",
         "replace_original": False,
-        "text": "3D viewer generated: https://x/view/abc",
+        "text": "3D ビューアを生成しました: https://x/view/abc",
     }
     with mock.patch.object(app_main, "verify_slack_request", return_value=True), \
          mock.patch.object(
-            app_main, "_process_smiles_sync", return_value=fake_payload
+            app_main, "process_and_save_frames", return_value=fake_payload
          ) as mproc, \
          mock.patch.object(
             app_main.tasks_dispatch, "enqueue_name_resolution"
@@ -144,21 +143,23 @@ def test_slack_mol_smiles_path_still_runs_sync(client):
 
 
 # ---------------------------------------------------------------------------
-# /internal/process — OIDC + schema guards
+# /internal/process — OIDC + schema guards (v2)
 # ---------------------------------------------------------------------------
 def _process_body(name: str = "hexafluorobenzene") -> dict:
     import hashlib
 
     idemp = hashlib.sha256(_RESPONSE_URL.encode()).hexdigest()[:32]
     return {
-        "schema_version": 1,
-        "kind": "name",
-        "payload": name,
+        "schema_version": 2,
+        "kind": "trajectory",
+        "segments": [{"kind": "name", "payload": name}],
+        "was_capped": False,
         "response_url": _RESPONSE_URL,
         "user_id": "U123",
         "channel_id": "C456",
         "base_url": _BASE_URL,
         "idempotency_key": idemp,
+        "flags": {"public": False, "label": False, "no_3d": False},
     }
 
 
@@ -179,6 +180,21 @@ def test_internal_process_bad_json_returns_400(client):
         resp = client.post(
             "/internal/process",
             content="not json",
+            headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+
+
+def test_internal_process_old_schema_v1_returns_400(client):
+    """Schema v1 payloads (single name field) must be rejected after
+    the v2 cutover — no in-flight tasks expected in a dev project."""
+    with mock.patch.object(app_main, "verify_oidc_token", return_value={"email": _PRINCIPAL}):
+        body = _process_body()
+        body["schema_version"] = 1
+        body["kind"] = "name"
+        resp = client.post(
+            "/internal/process",
+            content=json.dumps(body),
             headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
         )
     assert resp.status_code == 400
@@ -208,16 +224,28 @@ def test_internal_process_missing_fields_returns_400(client):
     assert resp.status_code == 400
 
 
+def test_internal_process_bad_segment_shape_returns_400(client):
+    with mock.patch.object(app_main, "verify_oidc_token", return_value={"email": _PRINCIPAL}):
+        body = _process_body()
+        body["segments"] = [{"kind": "unknown", "payload": "x"}]
+        resp = client.post(
+            "/internal/process",
+            content=json.dumps(body),
+            headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
+        )
+    assert resp.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # /internal/process — idempotency
 # ---------------------------------------------------------------------------
 def test_internal_process_duplicate_dispatch_skips_work(client):
     """Second dispatch with the same idempotency_key must short-circuit
-    to 204 without calling OPSIN or posting to ``response_url``.
+    to 204 without running the pipeline.
     """
     with mock.patch.object(app_main, "verify_oidc_token", return_value={"email": _PRINCIPAL}), \
          mock.patch.object(store, "claim_idempotency_key", return_value=False), \
-         mock.patch.object(app_main, "iupac_to_smiles") as mopsin, \
+         mock.patch.object(app_main, "process_and_save_frames") as mproc, \
          mock.patch.object(app_main.slack_dispatch, "post_to_response_url") as mpost:
         resp = client.post(
             "/internal/process",
@@ -225,7 +253,7 @@ def test_internal_process_duplicate_dispatch_skips_work(client):
             headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
         )
     assert resp.status_code == 204
-    assert mopsin.call_count == 0
+    assert mproc.call_count == 0
     assert mpost.call_count == 0
 
 
@@ -252,15 +280,12 @@ def test_internal_process_success_posts_viewer_url_to_response_url(client):
     fake_payload = {
         "response_type": "ephemeral",
         "replace_original": False,
-        "text": "3D viewer generated: https://x/view/abc",
+        "text": "3D ビューアを生成しました: https://x/view/abc",
     }
     with mock.patch.object(app_main, "verify_oidc_token", return_value={"email": _PRINCIPAL}), \
          mock.patch.object(store, "claim_idempotency_key", return_value=True), \
          mock.patch.object(
-            app_main, "iupac_to_smiles", return_value="Fc1c(F)c(F)c(F)c(F)c1F"
-         ) as mopsin, \
-         mock.patch.object(
-            app_main, "_process_smiles_sync", return_value=fake_payload
+            app_main, "process_and_save_frames", return_value=fake_payload
          ) as mproc, \
          mock.patch.object(
             app_main.slack_dispatch, "post_to_response_url", return_value=True
@@ -271,41 +296,14 @@ def test_internal_process_success_posts_viewer_url_to_response_url(client):
             headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
         )
     assert resp.status_code == 204
-    assert mopsin.call_count == 1
     assert mproc.call_count == 1
-    assert mproc.call_args.kwargs["smiles"] == "Fc1c(F)c(F)c(F)c(F)c1F"
-    assert mproc.call_args.kwargs["input_name"] == "hexafluorobenzene"
+    pkw = mproc.call_args.kwargs
+    assert pkw["segments"] == [("name", "hexafluorobenzene")]
+    assert pkw["was_capped"] is False
     assert mpost.call_count == 1
     posted_url, posted_payload = mpost.call_args.args
     assert posted_url == _RESPONSE_URL
     assert posted_payload == fake_payload
-
-
-def test_internal_process_opsin_user_error_posts_error_to_slack_204(client):
-    """An OPSIN failure (user error) MUST post the error message to
-    Slack and return 204 — retry would yield the same failure.
-    """
-    with mock.patch.object(app_main, "verify_oidc_token", return_value={"email": _PRINCIPAL}), \
-         mock.patch.object(store, "claim_idempotency_key", return_value=True), \
-         mock.patch.object(
-            app_main,
-            "iupac_to_smiles",
-            side_effect=MoleculeGenerationError("OPSIN は体系名のみ対応です..."),
-         ), \
-         mock.patch.object(app_main, "_process_smiles_sync") as mproc, \
-         mock.patch.object(
-            app_main.slack_dispatch, "post_to_response_url", return_value=True
-         ) as mpost:
-        resp = client.post(
-            "/internal/process",
-            content=json.dumps(_process_body()),
-            headers={"Authorization": "Bearer x", "Content-Type": "application/json"},
-        )
-    assert resp.status_code == 204
-    assert mproc.call_count == 0
-    assert mpost.call_count == 1
-    _, posted_payload = mpost.call_args.args
-    assert "OPSIN" in posted_payload["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -313,8 +311,7 @@ def test_internal_process_opsin_user_error_posts_error_to_slack_204(client):
 # ---------------------------------------------------------------------------
 def test_slack_mol_skips_signature_when_dev_flag_set(client, monkeypatch):
     """With DEV_SKIP_SIGNATURE_VERIFICATION=true, /slack/mol must accept
-    requests that carry no signature header (or a wrong one). This is
-    the local-dev path — tunnel + curl + Slack-without-prod-secret.
+    requests that carry no signature header (or a wrong one).
     """
     monkeypatch.setenv("DEV_SKIP_SIGNATURE_VERIFICATION", "true")
     from app.config import reload_settings
@@ -323,21 +320,18 @@ def test_slack_mol_skips_signature_when_dev_flag_set(client, monkeypatch):
     fake_payload = {
         "response_type": "ephemeral",
         "replace_original": False,
-        "text": "3D viewer generated: https://x/view/abc",
+        "text": "3D ビューアを生成しました: https://x/view/abc",
     }
     with mock.patch.object(app_main, "verify_slack_request") as mverify, \
          mock.patch.object(
-            app_main, "_process_smiles_sync", return_value=fake_payload
+            app_main, "process_and_save_frames", return_value=fake_payload
          ):
-        # No signature headers; in prod this would be 403.
         resp = client.post(
             "/slack/mol",
             data={"text": "CCO", "user_id": "U1", "channel_id": "C1"},
         )
     assert resp.status_code == 200
     assert resp.json() == fake_payload
-    # verify_slack_request must NOT have been called at all when the
-    # flag is on — short-circuit before HMAC work.
     assert mverify.call_count == 0
 
 
@@ -345,9 +339,6 @@ def test_slack_mol_enforces_signature_when_dev_flag_unset(client):
     """Regression: with the flag at its False default, /slack/mol still
     enforces signature verification (this is the prod path).
     """
-    # The autouse fixture does not set DEV_SKIP_SIGNATURE_VERIFICATION,
-    # so it defaults to False. Send a request with no/wrong signature
-    # and patch verify_slack_request to return False.
     with mock.patch.object(app_main, "verify_slack_request", return_value=False):
         resp = client.post(
             "/slack/mol",
@@ -357,10 +348,8 @@ def test_slack_mol_enforces_signature_when_dev_flag_unset(client):
 
 
 def test_slack_mol_name_uses_dev_dispatch_when_inline_flag_set(client, monkeypatch):
-    """With DEV_INLINE_NAME_RESOLUTION=true, the name: branch must route
-    through dev_dispatch.run_inline_name_resolution, NOT
-    tasks_dispatch.enqueue_name_resolution. Cloud Tasks is unavailable
-    in dev so the prod path would fail with TasksConfigError.
+    """With DEV_INLINE_NAME_RESOLUTION=true, the name-bearing branch
+    must route through dev_dispatch.run_inline_name_resolution.
     """
     monkeypatch.setenv("DEV_INLINE_NAME_RESOLUTION", "true")
     from app.config import reload_settings
@@ -382,13 +371,13 @@ def test_slack_mol_name_uses_dev_dispatch_when_inline_flag_set(client, monkeypat
     assert minline.call_count == 1
     assert menq.call_count == 0
     kwargs = minline.call_args.kwargs
-    assert kwargs["name"] == "hexafluorobenzene"
+    assert kwargs["segments"] == [("name", "hexafluorobenzene")]
     assert kwargs["response_url"] == _RESPONSE_URL
     assert kwargs["base_url"] == _BASE_URL
 
 
 def test_slack_mol_name_uses_tasks_dispatch_when_inline_flag_unset(client):
-    """Regression: with the flag False (autouse default), the name: branch
+    """Regression: with the flag False (autouse default), the name branch
     goes through Cloud Tasks, not the dev inline path.
     """
     with mock.patch.object(app_main, "verify_slack_request", return_value=True), \

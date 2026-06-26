@@ -9,8 +9,11 @@ iteration.
 Usage:
     .venv/Scripts/python.exe dev/render_viewer_sample.py
     .venv/Scripts/python.exe dev/render_viewer_sample.py --smiles "C/C=C/C"
+    # Multi-frame trajectory: ``;``-separated SMILES, same as /mol
+    .venv/Scripts/python.exe dev/render_viewer_sample.py \
+        --smiles "CCO ; CC(C)O ; CC(C)(C)O" --open
     .venv/Scripts/python.exe dev/render_viewer_sample.py --bare --open
-    .venv/Scripts/python.exe dev/render_viewer_sample.py --out preview.html
+    .venv/Scripts/python.exe dev/render_viewer_sample.py --mode 2d --open
 
 The default output path is `dev/_renders/sample.html` (gitignored).
 """
@@ -41,7 +44,11 @@ def _build_args() -> argparse.ArgumentParser:
     p.add_argument(
         "--smiles",
         default="CCO",
-        help='SMILES to render (default: "CCO", ethanol). Ignored with --bare.',
+        help=(
+            'SMILES to render (default: "CCO", ethanol). Use ``;`` to '
+            "render a multi-frame trajectory (the viewer ships a "
+            "navigation strip). Ignored with --bare."
+        ),
     )
     p.add_argument(
         "--bare",
@@ -94,53 +101,82 @@ def _build_args() -> argparse.ArgumentParser:
     return p
 
 
+def _split_segments(text: str) -> list[str]:
+    """Mirror the server-side ``app.main._split_segments`` semantics for
+    SMILES-only inputs: split on ``;``, strip whitespace, drop empties.
+    """
+    return [s for s in (p.strip() for p in text.split(";")) if s]
+
+
+def _build_frame(
+    smiles: str, *, include_meta: bool, render_svg: bool
+) -> dict | None:
+    """Run one SMILES through RDKit and (optionally) RDKit Draw, returning
+    the frame dict the template expects. ``None`` means "skip this one
+    and print an error" — preserves the order of remaining frames.
+    """
+    try:
+        molblock = generate_3d_molblock(smiles, max_atoms=200)
+    except MoleculeGenerationError as exc:
+        print(f"  [skip] {smiles!r}: {exc}", file=sys.stderr)
+        return None
+    formula = None
+    mol_weight = None
+    if include_meta:
+        formula, mol_weight = molblock_to_formula_and_weight(molblock)
+    svg_text = molblock_to_svg(molblock) if render_svg else None
+    return {
+        "kind": "smiles",
+        "input": smiles,
+        "smiles": smiles,
+        "molblock": molblock,
+        "formula": formula,
+        "mol_weight": mol_weight,
+        "svg_text": svg_text,
+        "error": None,
+    }
+
+
 def main() -> int:
     args = _build_args().parse_args()
 
     if args.bare:
-        smiles = None
-        molblock = None
-        mol_id = None
-        print(f"rendering bare viewer (drop-zone only)")
+        print("rendering bare viewer (drop-zone only)")
+        html = templates.render_viewer_html(frames=[])
     else:
-        smiles = args.smiles
-        try:
-            molblock = generate_3d_molblock(smiles, max_atoms=200)
-        except MoleculeGenerationError as exc:
-            print(f"ERROR: RDKit refused the SMILES — {exc}", file=sys.stderr)
+        segments = _split_segments(args.smiles)
+        if not segments:
+            print("ERROR: --smiles is empty", file=sys.stderr)
             return 2
-        mol_id = args.mol_id
+        include_meta = not args.no_meta
+        render_svg = args.mode == "2d"
         print(
-            f"rendering smiles={smiles!r} (molblock {len(molblock)} bytes) "
-            f"as mol_id={mol_id!r}"
+            f"rendering {len(segments)} frame(s) "
+            f"(mode={args.mode}, meta={'on' if include_meta else 'off'})"
         )
-
-    # Meta info (#6) — compute formula + MW unless --no-meta or --bare.
-    formula: str | None = None
-    mol_weight: float | None = None
-    if molblock and not args.no_meta:
-        formula, mol_weight = molblock_to_formula_and_weight(molblock)
-        if formula:
-            print(f"meta: formula={formula} MW={mol_weight:.2f}")
-
-    if args.mode == "2d" and molblock:
-        svg_text = molblock_to_svg(molblock)
-        html = templates.render_viewer_2d_html(
-            smiles=smiles,
-            svg_text=svg_text,
-            mol_id=mol_id,
-            formula=formula,
-            mol_weight=mol_weight,
-        )
-        print("rendering 2D SVG page (--mode 2d)")
-    else:
-        html = templates.render_viewer_html(
-            smiles=smiles,
-            molblock=molblock,
-            mol_id=mol_id,
-            formula=formula,
-            mol_weight=mol_weight,
-        )
+        frames: list[dict] = []
+        for smi in segments:
+            frame = _build_frame(
+                smi, include_meta=include_meta, render_svg=render_svg
+            )
+            if frame is not None:
+                frames.append(frame)
+                tag = (
+                    f"formula={frame['formula']} MW={frame['mol_weight']:.2f}"
+                    if frame["formula"] else "(no meta)"
+                )
+                print(f"  [{len(frames)}] {smi!r} -> {tag}")
+        if not frames:
+            print("ERROR: no frames rendered (all SMILES failed)", file=sys.stderr)
+            return 2
+        if args.mode == "2d":
+            html = templates.render_viewer_2d_html(
+                frames=frames, mol_id=args.mol_id
+            )
+        else:
+            html = templates.render_viewer_html(
+                frames=frames, mol_id=args.mol_id
+            )
 
     out: Path = args.out
     out.parent.mkdir(parents=True, exist_ok=True)

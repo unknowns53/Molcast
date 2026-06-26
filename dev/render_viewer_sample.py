@@ -28,7 +28,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from app import templates
-from app.rdkit_utils import MoleculeGenerationError, generate_3d_molblock
+from app.rdkit_utils import (
+    MoleculeGenerationError,
+    generate_3d_molblock,
+    molblock_to_formula_and_weight,
+    molblock_to_svg,
+)
 
 
 def _build_args() -> argparse.ArgumentParser:
@@ -69,6 +74,23 @@ def _build_args() -> argparse.ArgumentParser:
         action="store_true",
         help="After writing, open the file in the default web browser.",
     )
+    p.add_argument(
+        "--mode",
+        choices=("3d", "2d"),
+        default="3d",
+        help=(
+            "Render the 3D viewer (default) or the 2D SVG page used by "
+            "the /mol --no-3d flag (#3). Ignored with --bare."
+        ),
+    )
+    p.add_argument(
+        "--no-meta",
+        action="store_true",
+        help=(
+            "Skip the formula / MW meta pill block. Default behaviour "
+            "is to compute them from the MolBlock and pass to the template."
+        ),
+    )
     return p
 
 
@@ -93,9 +115,32 @@ def main() -> int:
             f"as mol_id={mol_id!r}"
         )
 
-    html = templates.render_viewer_html(
-        smiles=smiles, molblock=molblock, mol_id=mol_id
-    )
+    # Meta info (#6) — compute formula + MW unless --no-meta or --bare.
+    formula: str | None = None
+    mol_weight: float | None = None
+    if molblock and not args.no_meta:
+        formula, mol_weight = molblock_to_formula_and_weight(molblock)
+        if formula:
+            print(f"meta: formula={formula} MW={mol_weight:.2f}")
+
+    if args.mode == "2d" and molblock:
+        svg_text = molblock_to_svg(molblock)
+        html = templates.render_viewer_2d_html(
+            smiles=smiles,
+            svg_text=svg_text,
+            mol_id=mol_id,
+            formula=formula,
+            mol_weight=mol_weight,
+        )
+        print("rendering 2D SVG page (--mode 2d)")
+    else:
+        html = templates.render_viewer_html(
+            smiles=smiles,
+            molblock=molblock,
+            mol_id=mol_id,
+            formula=formula,
+            mol_weight=mol_weight,
+        )
 
     out: Path = args.out
     out.parent.mkdir(parents=True, exist_ok=True)

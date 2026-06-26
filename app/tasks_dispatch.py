@@ -75,10 +75,16 @@ def _build_payload(
     channel_id: str | None,
     base_url: str,
     idempotency_key: str,
+    flags: dict[str, bool] | None = None,
 ) -> bytes:
     """JSON payload for ``/internal/process``. Kept narrow on purpose —
     every field is needed by the worker, and adding fields here is a
     schema change that requires a coordinated rollout.
+
+    ``flags`` carries the parsed ``--public`` / ``--label`` / ``--no-3d``
+    state from the slash command (#3). The worker reads it back as an
+    optional field; if missing the worker defaults to all-False, which
+    is backward-compatible with old in-flight tasks.
     """
     body: dict[str, Any] = {
         "schema_version": 1,
@@ -89,6 +95,7 @@ def _build_payload(
         "channel_id": channel_id,
         "base_url": base_url,
         "idempotency_key": idempotency_key,
+        "flags": flags or {"public": False, "label": False, "no_3d": False},
     }
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
@@ -101,6 +108,7 @@ def enqueue_name_resolution(
     channel_id: str | None,
     base_url: str,
     settings: Settings,
+    flags: dict[str, bool] | None = None,
 ) -> str:
     """Enqueue a name-resolution task. Returns the task name string
     (so callers can log the resource identifier). Raises
@@ -146,6 +154,7 @@ def enqueue_name_resolution(
             channel_id=channel_id,
             base_url=base_url,
             idempotency_key=idempotency,
+            flags=flags,
         ),
         oidc_token=tasks_v2.OidcToken(
             service_account_email=settings.TASKS_INVOKER_SA,

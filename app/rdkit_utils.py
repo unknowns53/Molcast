@@ -8,7 +8,8 @@ environment variable (see §10).
 from __future__ import annotations
 
 from rdkit import Chem
-from rdkit.Chem import AllChem
+from rdkit.Chem import AllChem, Descriptors
+from rdkit.Chem.Draw import rdMolDraw2D
 
 
 EMBED_SEEDS: tuple[int, ...] = (0xF00D, 0xBEEF, 0x1234)
@@ -99,3 +100,61 @@ def count_atoms_with_hs(smiles: str) -> int | None:
     if mol is None:
         return None
     return Chem.AddHs(mol).GetNumAtoms()
+
+
+# ---------------------------------------------------------------------------
+# Viewer metadata helpers (#6, #3 --no-3d)
+# ---------------------------------------------------------------------------
+def molblock_to_formula_and_weight(
+    molblock: str,
+) -> tuple[str | None, float | None]:
+    """Return ``(formula, mol_weight)`` for a stored MolBlock.
+
+    Both fields are ``None`` on parse failure. The MolBlock is the
+    canonical structure (it carries explicit hydrogens from our embed
+    pipeline) so ``MolWt`` uses the right H count without re-AddHs.
+    Defensive: any RDKit exception falls through to ``(None, None)`` —
+    the viewer is still useful without the meta pills.
+    """
+    if not molblock:
+        return (None, None)
+    try:
+        mol = Chem.MolFromMolBlock(molblock, removeHs=False)
+        if mol is None:
+            return (None, None)
+        formula = Chem.rdMolDescriptors.CalcMolFormula(mol)
+        weight = float(Descriptors.MolWt(mol))
+        return (formula, weight)
+    except Exception:
+        return (None, None)
+
+
+def molblock_to_svg(
+    molblock: str, *, width: int = 600, height: int = 480
+) -> str | None:
+    """Render a 2D depiction from the stored MolBlock as SVG text.
+
+    Used by the ``--no-3d`` flag (#3). Returns ``None`` on parse
+    failure. The 2D coordinates are computed fresh via
+    ``Chem.AllChem.Compute2DCoords`` because our stored MolBlock holds
+    3D coordinates from the embed step, and ``MolDraw2DSVG`` would
+    otherwise project them into the page plane (cluttered overlap).
+
+    Hydrogens are stripped before depiction — a flat 2D drawing with
+    every H drawn is unreadable for any molecule larger than a few
+    atoms.
+    """
+    if not molblock:
+        return None
+    try:
+        mol = Chem.MolFromMolBlock(molblock, removeHs=False)
+        if mol is None:
+            return None
+        mol = Chem.RemoveHs(mol)
+        AllChem.Compute2DCoords(mol)
+        drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+        drawer.DrawMolecule(mol)
+        drawer.FinishDrawing()
+        return drawer.GetDrawingText()
+    except Exception:
+        return None

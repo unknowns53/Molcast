@@ -38,7 +38,12 @@ from .config import Settings, get_settings
 from .logging_config import configure_logging
 from .oidc_verify import OIDCVerificationError, verify_oidc_token
 from .opsin_utils import iupac_to_smiles
-from .rdkit_utils import MoleculeGenerationError, generate_3d_molblock
+from .rdkit_utils import (
+    MoleculeGenerationError,
+    generate_3d_molblock,
+    molblock_to_formula_and_weight,
+    molblock_to_svg,
+)
 from .slack_verify import verify_slack_request
 from .tasks_dispatch import TasksConfigError
 
@@ -63,6 +68,20 @@ async def _lifespan(app: FastAPI):
                 "skip_signature": settings.DEV_SKIP_SIGNATURE_VERIFICATION,
                 "inline_name": settings.DEV_INLINE_NAME_RESOLUTION,
             },
+        )
+    # Cold-start warm-up (#8). The first /mol CCO after a fresh instance
+    # spin-up pays the cost of importing rdkit.Chem.AllChem (heavy
+    # Boost::Python module) AND warming RDKit's internal force-field
+    # parameter cache. Doing one dummy embed here pulls both costs out
+    # of the user-visible request path. Failure is logged and swallowed
+    # — startup must not crash because of a warm-up issue.
+    try:
+        generate_3d_molblock("CCO", max_atoms=settings.MAX_ATOMS)
+        logger.info("warmup_ok")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "warmup_failed",
+            extra={"error_kind": type(exc).__name__},
         )
     yield
 
@@ -112,6 +131,57 @@ def _classify_text(text: str) -> tuple[str, str]:
     return ("smiles", cleaned)
 
 
+# `/mol` flag parsing (#3) -------------------------------------------------
+# Known flags (whitespace-delimited tokens stripped from the input before
+# classification). Order-independent. Unknown ``--flag`` tokens are left in
+# place — they fall through to SMILES classification and OPSIN will reject
+# them with the standard user error, which surfaces the typo.
+_FLAG_PUBLIC = "--public"
+_FLAG_LABEL = "--label"
+_FLAG_NO_3D = "--no-3d"
+_KNOWN_FLAGS = frozenset({_FLAG_PUBLIC, _FLAG_LABEL, _FLAG_NO_3D})
+
+
+def _extract_flags(text: str) -> tuple[dict[str, bool], str]:
+    """Return ``(flags, cleaned_text)`` with known ``--flag`` tokens removed.
+
+    Flags are matched as whole whitespace-separated tokens so they cannot
+    accidentally chew into a SMILES (SMILES never contains whitespace).
+    """
+    flags = {"public": False, "label": False, "no_3d": False}
+    tokens = (text or "").split()
+    kept: list[str] = []
+    for tok in tokens:
+        if tok == _FLAG_PUBLIC:
+            flags["public"] = True
+        elif tok == _FLAG_LABEL:
+            flags["label"] = True
+        elif tok == _FLAG_NO_3D:
+            flags["no_3d"] = True
+        else:
+            kept.append(tok)
+    # Preserve a leading "name:" attached to the next token (Slack splits
+    # on whitespace just like we do, so "name: ethanol" arrives as two
+    # tokens "name:" and "ethanol" — re-joining with a single space
+    # is what _classify_text expects).
+    return (flags, " ".join(kept))
+
+
+def _viewer_url_with_flags(
+    base_url: str, mol_id: str, flags: dict[str, bool]
+) -> str:
+    """Append ``?label=1`` / ``?mode=2d`` query params from the flag dict."""
+    params: list[str] = []
+    if flags.get("label"):
+        params.append("label=1")
+    if flags.get("no_3d"):
+        params.append("mode=2d")
+    url = f"{base_url}/view/{mol_id}"
+    if params:
+        url += "?" + "&".join(params)
+    return url
+
+
 def _process_smiles_sync(
     *,
     smiles: str,
@@ -120,6 +190,7 @@ def _process_smiles_sync(
     base_url: str,
     settings: Settings,
     input_name: str | None = None,
+    flags: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     """SMILES -> RDKit -> Firestore -> Slack response payload.
 
@@ -131,8 +202,21 @@ def _process_smiles_sync(
     ``input_name`` is the original ``/mol name: ...`` input (Phase 3); it
     is persisted to Firestore but the rest of the pipeline operates on
     the resolved SMILES. ``None`` for the SMILES route.
+
+    ``flags`` is the parsed flag dict from :func:`_extract_flags` (#3).
+    Recognised keys: ``public`` (in_channel response_type), ``label``
+    (query param on viewer URL), ``no_3d`` (route viewer to 2D mode).
+    ``None`` is treated as all-False.
     """
     started = time.monotonic()
+    flags = flags or {"public": False, "label": False, "no_3d": False}
+    # --public overrides the configured response scope so the final
+    # message lands in_channel even when the deploy default is
+    # ephemeral. The error branches below use the configured default so
+    # rdkit errors don't get loudly posted to the channel.
+    success_response_type = (
+        "in_channel" if flags.get("public") else settings.SLACK_RESPONSE_TYPE
+    )
     try:
         molblock = generate_3d_molblock(smiles, max_atoms=settings.MAX_ATOMS)
     except MoleculeGenerationError as exc:
@@ -177,7 +261,7 @@ def _process_smiles_sync(
             response_type=settings.SLACK_RESPONSE_TYPE,
         )
 
-    viewer_url = f"{base_url}/view/{mol_id}"
+    viewer_url = _viewer_url_with_flags(base_url, mol_id, flags)
     log_extra: dict[str, Any] = {
         "mol_id": mol_id,
         "created_by": user_id,
@@ -185,14 +269,27 @@ def _process_smiles_sync(
         "smiles_len": len(smiles),
         "molblock_len": len(molblock),
         "elapsed_ms": int((time.monotonic() - started) * 1000),
+        "flag_public": bool(flags.get("public")),
+        "flag_label": bool(flags.get("label")),
+        "flag_no_3d": bool(flags.get("no_3d")),
     }
     if input_name is not None:
         log_extra["input_name_len"] = len(input_name)
     logger.info("mol_created", extra=log_extra)
+
+    # 完了文に何を生成したかを 1 行添える (#1)。
+    # name: 経路は `<入力名>` -> `<SMILES>` の対応を見せる。
+    # SMILES 経路は SMILES だけ載せる。Slack のバッククォートでコード扱い
+    # にして長い文字列でも改行が走らないようにする。
+    if input_name:
+        provenance = f"`{input_name}` → `{smiles}`"
+    else:
+        provenance = f"SMILES: `{smiles}`"
+    heading = "2D 構造ビューア" if flags.get("no_3d") else "3D ビューア"
     return {
-        "response_type": settings.SLACK_RESPONSE_TYPE,
+        "response_type": success_response_type,
         "replace_original": False,
-        "text": f"3D viewer generated: {viewer_url}",
+        "text": f"{heading}を生成しました: {viewer_url}\n{provenance}",
     }
 
 
@@ -227,12 +324,16 @@ async def slack_mol(request: Request) -> JSONResponse:
 
     base_url = _base_url(request, settings)
 
-    kind, payload = _classify_text(text)
+    # Pull flags first so the residual text classifies cleanly.
+    flags, residual_text = _extract_flags(text)
+    kind, payload = _classify_text(residual_text)
 
     if kind == "empty":
         return JSONResponse(
             _ephemeral(
                 "使い方: `/mol <SMILES>` または `/mol name: <IUPAC 名>`\n"
+                "オプション: `--public` (チャンネルに投稿) / "
+                "`--label` (原子ラベル表示) / `--no-3d` (2D 描画のみ)\n"
                 f"座標ファイルを描画するには {base_url}/view/ を開いてドラッグ&ドロップしてください。"
             )
         )
@@ -264,6 +365,7 @@ async def slack_mol(request: Request) -> JSONResponse:
                     channel_id=channel_id,
                     base_url=base_url,
                     settings=settings,
+                    flags=flags,
                 )
             else:
                 task_name = tasks_dispatch.enqueue_name_resolution(
@@ -273,6 +375,7 @@ async def slack_mol(request: Request) -> JSONResponse:
                     channel_id=channel_id,
                     base_url=base_url,
                     settings=settings,
+                    flags=flags,
                 )
         except TasksConfigError as exc:
             logger.exception(
@@ -302,9 +405,12 @@ async def slack_mol(request: Request) -> JSONResponse:
             },
         )
         del task_name
+        # 何を解決中かを ack に出すと、複数同時実行時にどれが自分のリクエスト
+        # か追えるようになる。"処理中" を残してあるのは test_main.py の
+        # 既存アサーション (#1) と運用的な検索性のため。
         return JSONResponse(
             _ephemeral(
-                "処理中です... 完了したら結果を投稿します。",
+                f"`{payload}` を処理中です。完了したら結果を投稿します。",
                 response_type=settings.SLACK_RESPONSE_TYPE,
             )
         )
@@ -318,6 +424,7 @@ async def slack_mol(request: Request) -> JSONResponse:
             channel_id=channel_id,
             base_url=base_url,
             settings=settings,
+            flags=flags,
         )
     )
 
@@ -375,6 +482,14 @@ async def internal_process(request: Request) -> Response:
     channel_id: str | None = body.get("channel_id")
     base_url: str = body.get("base_url") or ""
     idempotency_key: str = body.get("idempotency_key") or ""
+    # Flags propagated from the slash command (#3). Optional in the
+    # schema so old tasks in flight before the upgrade still parse.
+    raw_flags = body.get("flags") or {}
+    flags = {
+        "public": bool(raw_flags.get("public")),
+        "label": bool(raw_flags.get("label")),
+        "no_3d": bool(raw_flags.get("no_3d")),
+    }
     if not name or not response_url or not base_url or not idempotency_key:
         return PlainTextResponse("bad request", status_code=400)
 
@@ -433,6 +548,7 @@ async def internal_process(request: Request) -> Response:
         channel_id=channel_id,
         base_url=base_url,
         settings=settings,
+        flags=flags,
     )
     slack_dispatch.post_to_response_url(response_url, payload)
     return PlainTextResponse("", status_code=204)
@@ -442,7 +558,7 @@ async def internal_process(request: Request) -> Response:
 # Viewer endpoints
 # ---------------------------------------------------------------------------
 @app.get("/view/{mol_id}", response_class=HTMLResponse)
-def view_mol(mol_id: str) -> HTMLResponse:
+def view_mol(mol_id: str, request: Request) -> HTMLResponse:
     settings = get_settings()
     try:
         data = store.get_molecule(mol_id, collection=settings.FIRESTORE_COLLECTION)
@@ -459,11 +575,34 @@ def view_mol(mol_id: str) -> HTMLResponse:
             templates.render_expired_html(settings.RETENTION_DAYS),
             status_code=410,
         )
+
+    smiles = data.get("smiles")
+    molblock = data.get("molblock")
+    # Compute formula / MW once per request (#6). RDKit failure leaves
+    # both as None — the template handles that gracefully.
+    formula, mol_weight = molblock_to_formula_and_weight(molblock or "")
+
+    # ``?mode=2d`` (from /mol --no-3d, or hand-typed) renders the static
+    # SVG page instead of 3Dmol.js (#3).
+    if request.query_params.get("mode") == "2d":
+        svg_text = molblock_to_svg(molblock or "")
+        return HTMLResponse(
+            templates.render_viewer_2d_html(
+                smiles=smiles,
+                svg_text=svg_text,
+                mol_id=mol_id,
+                formula=formula,
+                mol_weight=mol_weight,
+            )
+        )
+
     return HTMLResponse(
         templates.render_viewer_html(
-            smiles=data.get("smiles"),
-            molblock=data.get("molblock"),
+            smiles=smiles,
+            molblock=molblock,
             mol_id=mol_id,
+            formula=formula,
+            mol_weight=mol_weight,
         )
     )
 

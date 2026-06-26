@@ -55,9 +55,15 @@ _ALIASES: dict[str, str] | None = None
 
 
 _USER_AGENT = "molcast/0.1"
+# OPSIN がパースできない場合のユーザ向けメッセージ。具体例を 3 行添えて
+# 「次に何を打てばいいか」を即座に示す (#2)。Slack ではバッククォートで
+# コード扱いになるので、コピー&ペーストでそのまま動く。
 _FALLBACK_ERROR_MESSAGE = (
-    "OPSIN は体系名のみ対応です。慣用名・商品名は解釈できません。"
-    "SMILES を直接入力してください: `/mol <SMILES>`"
+    "OPSIN は体系名のみ対応です。慣用名・商品名は解釈できません。\n"
+    "SMILES を直接入力するか、登録済みエイリアスをお使いください。例:\n"
+    "  • `/mol CCO` (エタノール)\n"
+    "  • `/mol c1ccccc1` (ベンゼン)\n"
+    "  • `/mol name: DMSO` (エイリアス経由)"
 )
 
 

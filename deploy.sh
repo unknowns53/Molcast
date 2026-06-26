@@ -48,10 +48,15 @@ if [ "$PROJECT_ID" = "CHANGE_ME" ]; then
 fi
 
 # Step 1: Build via Cloud Build with --cache-from (cloudbuild.yaml).
+# --suppress-logs: skip log streaming. Some accounts hit "Viewer/Owner"
+# streaming permission errors even with Owner role; suppressing the
+# stream sidesteps the check. Build output stays in the Cloud Build
+# console.
 gcloud builds submit \
     --project "$PROJECT_ID" \
     --config cloudbuild.yaml \
-    --substitutions "_REGION=${REGION},_REPO=${AR_REPO},_IMAGE=${SERVICE_NAME}"
+    --substitutions "_REGION=${REGION},_REPO=${AR_REPO},_IMAGE=${SERVICE_NAME}" \
+    --suppress-logs
 
 # Step 2: Deploy from AR. We pass --image (not --source) so Cloud Run
 # uses the cache-hot image we just built rather than triggering a

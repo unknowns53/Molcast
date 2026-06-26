@@ -52,6 +52,7 @@ def _resolve_and_post(
     channel_id: str | None,
     base_url: str,
     settings: Settings,
+    flags: dict[str, bool] | None = None,
 ) -> None:
     """Thread target. Mirrors the OIDC-less subset of
     :func:`app.main.internal_process` — OPSIN → SMILES → RDKit →
@@ -97,6 +98,7 @@ def _resolve_and_post(
         channel_id=channel_id,
         base_url=base_url,
         settings=settings,
+        flags=flags,
     )
     slack_dispatch.post_to_response_url(response_url, payload)
     logger.info(
@@ -113,6 +115,7 @@ def run_inline_name_resolution(
     channel_id: str | None,
     base_url: str,
     settings: Settings,
+    flags: dict[str, bool] | None = None,
 ) -> str:
     """Spawn the resolution thread and return a synthetic ``task_name``.
 
@@ -129,6 +132,7 @@ def run_inline_name_resolution(
             "channel_id": channel_id,
             "base_url": base_url,
             "settings": settings,
+            "flags": flags,
         },
         daemon=True,
         name=f"dev-inline-{key[:8]}",

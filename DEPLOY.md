@@ -470,7 +470,7 @@ gcloud run services logs read mol-slack-viewer --region asia-northeast1 --limit 
 
 ブラウザで `https://<service-url>/view/` を開く。`.pdb` / `.sdf` / `.mol2` / `.xyz` / `.cube` のファイルをビューアペインにドラッグして描画されることを確認。`.cif` をドロップしてエラー領域に日本語の「未対応形式」メッセージが出ることを確認。
 
-## 9. コールドスタート計測 (必要な場合のみ)
+## 9. コールドスタート計測と緩和
 
 サービスを 10 分ほど放置してから `/mol CCO` を打ち、ack からビューア URL までの間隔を計測する。
 
@@ -478,7 +478,46 @@ gcloud run services logs read mol-slack-viewer --region asia-northeast1 --limit 
 gcloud run services logs read mol-slack-viewer --region asia-northeast1 --limit 5
 ```
 
-`elapsed_ms` が各 `mol_created` レコードに入っている。コールドスタート遅延が常時きつければ `--min-instances 1` でデプロイし直す。`README.md` §11 を参照。
+`elapsed_ms` が各 `mol_created` レコードに入っている。
+
+### 9.1 アプリ側の warm-up (既定で ON)
+
+`app/main.py` の `_lifespan` は startup 時に `generate_3d_molblock("CCO")` を一度走らせ、`rdkit.Chem.AllChem` の import と ETKDG パラメータキャッシュを温めている。Cloud Run は startup probe (= lifespan 完了) を待ってから traffic を流すので、ユーザの初回 `/mol CCO` はこのコストを払い済みの状態で着信する。warm-up に要する時間は通常 2-4 秒、コンテナ起動全体ではおよそ 5-8 秒。失敗しても WARNING ログを残して起動は続行する。
+
+warm-up が遅すぎる (= startup probe timeout が出る) なら、`--cpu-boost` で起動時 CPU を一時的に倍加させる:
+
+```powershell
+gcloud run services update mol-slack-viewer `
+    --region=asia-northeast1 --project=$env:PROJECT_ID `
+    --cpu-boost
+```
+
+`--cpu-boost` は起動時のみ追加 CPU を割り当て、定常時の課金は変わらない。warm-up 時間が半減する目安。
+
+### 9.2 それでも常時きつい場合
+
+warm-up を入れても、Cloud Run の VM 払い出しと Python interpreter 起動自体に 3-5 秒かかる (RDKit 込みのイメージなので import が重い)。Slack の 3 秒 ack 窓を確実に守りたければ:
+
+```powershell
+gcloud run services update mol-slack-viewer `
+    --region=asia-northeast1 --project=$env:PROJECT_ID `
+    --min-instances=1
+```
+
+`--min-instances=1` は idle 中も 1 インスタンス常駐になり、`--cpu-throttling` 既定下では月 ~¥400 程度。研究室で複数人が日次で叩く規模なら投資する価値はある。`README.md` §11 も参照。
+
+### 9.3 外部からの定期 warm ping (任意)
+
+「お金は払わずに常時 warm にしたい」なら Cloud Scheduler から 5 分おきに `/health` を叩くだけで Cloud Run の idle 時間が 0 のままに保たれる。Cloud Scheduler の無料枠は月 3 ジョブまでなので 1 ジョブで収まる。
+
+```powershell
+gcloud scheduler jobs create http molcast-warmup `
+    --location=asia-northeast1 --schedule="*/5 * * * *" `
+    --uri="https://mol-slack-viewer-xxxxxxxx-an.a.run.app/health" `
+    --http-method=GET --project=$env:PROJECT_ID
+```
+
+`--min-instances=1` と機能的には同等で、課金構造だけが違う (Scheduler 自体は無料、Cloud Run の active 課金が代わりに乗る)。Phase 1 の `/health` は同期処理で 1 ms オーダーなので、5 分おきに 1 リクエストでも Cloud Run の active 時間は無視できる。
 
 ## 10. 満足したら `main` に取り込む
 

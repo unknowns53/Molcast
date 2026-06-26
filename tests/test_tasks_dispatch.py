@@ -17,9 +17,11 @@ from app.tasks_dispatch import TasksConfigError
 
 
 _BASE_URL = "https://mol-slack-viewer-xxxxxxxx-an.a.run.app"
-_RESPONSE_URL = (
-    "https://hooks.slack.com/commands/T000/123/abc"
-)
+_RESPONSE_URL = "https://hooks.slack.com/commands/T000/123/abc"
+
+
+def _seg(name: str) -> list[tuple[str, str]]:
+    return [("name", name)]
 
 
 @pytest.fixture
@@ -60,7 +62,8 @@ def test_missing_required_env_raises_config_error(field, blank_value, settings):
     setattr(settings, field, blank_value)
     with pytest.raises(TasksConfigError):
         tasks_dispatch.enqueue_name_resolution(
-            name="ethanol",
+            segments=_seg("ethanol"),
+            was_capped=False,
             response_url=_RESPONSE_URL,
             user_id=None,
             channel_id=None,
@@ -72,11 +75,28 @@ def test_missing_required_env_raises_config_error(field, blank_value, settings):
 def test_blank_base_url_raises_config_error(settings):
     with pytest.raises(TasksConfigError):
         tasks_dispatch.enqueue_name_resolution(
-            name="ethanol",
+            segments=_seg("ethanol"),
+            was_capped=False,
             response_url=_RESPONSE_URL,
             user_id=None,
             channel_id=None,
             base_url="",
+            settings=settings,
+        )
+
+
+def test_empty_segments_raises_config_error(settings):
+    """A trajectory enqueue with zero segments is a programmer error
+    upstream (slack_mol already short-circuits on empty input); surface
+    it instead of silently sending a useless task."""
+    with pytest.raises(TasksConfigError):
+        tasks_dispatch.enqueue_name_resolution(
+            segments=[],
+            was_capped=False,
+            response_url=_RESPONSE_URL,
+            user_id=None,
+            channel_id=None,
+            base_url=_BASE_URL,
             settings=settings,
         )
 
@@ -92,14 +112,17 @@ def test_enqueue_builds_correct_task(settings):
     fake_client.queue_path.return_value = (
         "projects/example-proj/locations/asia-northeast1/queues/molcast-name-resolution"
     )
+    segments = [("name", "hexafluorobenzene"), ("smiles", "CCO")]
     with mock.patch.object(tasks_dispatch, "_client", fake_client):
         task_name = tasks_dispatch.enqueue_name_resolution(
-            name="hexafluorobenzene",
+            segments=segments,
+            was_capped=False,
             response_url=_RESPONSE_URL,
             user_id="U123",
             channel_id="C456",
             base_url=_BASE_URL,
             settings=settings,
+            flags={"public": True, "label": False, "no_3d": False},
         )
 
     assert fake_client.create_task.call_count == 1
@@ -126,13 +149,18 @@ def test_enqueue_builds_correct_task(settings):
     )
 
     body = json.loads(task.http_request.body)
-    assert body["kind"] == "name"
-    assert body["payload"] == "hexafluorobenzene"
+    assert body["schema_version"] == 2
+    assert body["kind"] == "trajectory"
+    assert body["segments"] == [
+        {"kind": "name", "payload": "hexafluorobenzene"},
+        {"kind": "smiles", "payload": "CCO"},
+    ]
+    assert body["was_capped"] is False
     assert body["response_url"] == _RESPONSE_URL
     assert body["user_id"] == "U123"
     assert body["channel_id"] == "C456"
     assert body["base_url"] == _BASE_URL
-    assert body["schema_version"] == 1
+    assert body["flags"]["public"] is True
     assert body["idempotency_key"] == task_name.rsplit("/", 1)[-1]
 
 
@@ -147,7 +175,8 @@ def test_enqueue_swallows_already_exists(settings):
     with mock.patch.object(tasks_dispatch, "_client", fake_client):
         # Must NOT raise.
         task_name = tasks_dispatch.enqueue_name_resolution(
-            name="ethanol",
+            segments=_seg("ethanol"),
+            was_capped=False,
             response_url=_RESPONSE_URL,
             user_id=None,
             channel_id=None,

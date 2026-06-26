@@ -70,14 +70,21 @@ def test_new_mol_id_is_url_safe_and_unguessable():
     assert len(a) == 22
 
 
-def test_save_molecule_writes_expected_fields():
+def test_save_trajectory_writes_expected_fields():
     fake = _FakeClient()
     with mock.patch.object(store, "_client", return_value=fake):
-        store.save_molecule(
+        store.save_trajectory(
             mol_id="abc",
-            smiles="CCO",
-            molblock="MOLDATA",
-            input_name=None,
+            frames=[
+                {
+                    "kind": "smiles",
+                    "input": "CCO",
+                    "smiles": "CCO",
+                    "molblock": "MOLDATA",
+                    "error": None,
+                }
+            ],
+            flags={"public": False, "label": True, "no_3d": False},
             created_by="U1",
             channel_id="C1",
             collection="molecules",
@@ -87,14 +94,41 @@ def test_save_molecule_writes_expected_fields():
     assert len(doc.set_calls) == 1
     record = doc.set_calls[0]
     assert record["id"] == "abc"
-    assert record["smiles"] == "CCO"
-    assert record["molblock"] == "MOLDATA"
-    assert record["input_name"] is None
+    assert isinstance(record["frames"], list) and len(record["frames"]) == 1
+    f0 = record["frames"][0]
+    assert f0["smiles"] == "CCO"
+    assert f0["molblock"] == "MOLDATA"
+    assert f0["kind"] == "smiles"
+    assert f0["error"] is None
+    assert record["flags"]["label"] is True
     assert record["created_by"] == "U1"
     assert record["channel_id"] == "C1"
     # expires_at - created_at = retention_days (with sub-second tolerance).
     delta = record["expires_at"] - record["created_at"]
     assert abs(delta - _dt.timedelta(days=7)) < _dt.timedelta(seconds=1)
+
+
+def test_save_trajectory_drops_unknown_frame_keys():
+    """A frame dict with stray keys (forgotten kwargs from callers) must
+    not pollute Firestore. Only the documented frame schema persists."""
+    fake = _FakeClient()
+    with mock.patch.object(store, "_client", return_value=fake):
+        store.save_trajectory(
+            mol_id="abc",
+            frames=[
+                {
+                    "kind": "smiles", "input": "CCO",
+                    "smiles": "CCO", "molblock": "M", "error": None,
+                    "extra_garbage": "x", "secret": "y",
+                }
+            ],
+            flags=None,
+            created_by=None, channel_id=None,
+            collection="molecules", retention_days=7,
+        )
+    record = fake.collections["molecules"].docs["abc"].set_calls[0]
+    assert "extra_garbage" not in record["frames"][0]
+    assert "secret" not in record["frames"][0]
 
 
 def test_get_molecule_missing_returns_none():
@@ -103,19 +137,65 @@ def test_get_molecule_missing_returns_none():
         assert store.get_molecule("nope", collection="molecules") is None
 
 
-def test_get_molecule_live_returns_data():
+def test_get_molecule_live_returns_normalised_frames():
+    fake = _FakeClient()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    fake.collection("molecules").document("abc").stage({
+        "id": "abc",
+        "frames": [
+            {"kind": "smiles", "input": "CCO", "smiles": "CCO",
+             "molblock": "M", "error": None},
+        ],
+        "expires_at": now + _dt.timedelta(days=7),
+    })
+    with mock.patch.object(store, "_client", return_value=fake):
+        out = store.get_molecule("abc", collection="molecules")
+    assert out is not None
+    assert out["frames"][0]["smiles"] == "CCO"
+
+
+def test_get_molecule_legacy_single_mol_doc_is_normalised():
+    """A document written before the trajectory schema (top-level
+    ``smiles`` / ``molblock`` / ``input_name``) must be rendered to the
+    caller as a single-frame trajectory. Otherwise old 7-day-TTL docs
+    return blank pages."""
     fake = _FakeClient()
     now = _dt.datetime.now(_dt.timezone.utc)
     fake.collection("molecules").document("abc").stage({
         "id": "abc",
         "smiles": "CCO",
         "molblock": "M",
+        "input_name": None,
         "expires_at": now + _dt.timedelta(days=7),
     })
     with mock.patch.object(store, "_client", return_value=fake):
         out = store.get_molecule("abc", collection="molecules")
     assert out is not None
-    assert out["smiles"] == "CCO"
+    assert "frames" in out
+    assert len(out["frames"]) == 1
+    assert out["frames"][0]["smiles"] == "CCO"
+    assert out["frames"][0]["molblock"] == "M"
+    assert out["frames"][0]["kind"] == "smiles"
+    # Legacy docs implicitly carry the all-false flag set.
+    assert out["flags"]["label"] is False
+
+
+def test_get_molecule_legacy_name_doc_kind_is_name():
+    """A legacy doc whose ``input_name`` is set was a ``/mol name: ...``
+    invocation; the normaliser must mark the frame kind as ``name``."""
+    fake = _FakeClient()
+    now = _dt.datetime.now(_dt.timezone.utc)
+    fake.collection("molecules").document("abc").stage({
+        "id": "abc",
+        "smiles": "CO",
+        "molblock": "M",
+        "input_name": "methanol",
+        "expires_at": now + _dt.timedelta(days=7),
+    })
+    with mock.patch.object(store, "_client", return_value=fake):
+        out = store.get_molecule("abc", collection="molecules")
+    assert out["frames"][0]["kind"] == "name"
+    assert out["frames"][0]["input"] == "methanol"
 
 
 def test_get_molecule_expired_returns_sentinel():

@@ -1,13 +1,12 @@
-"""Tests for the local-dev inline name-resolution runner.
+"""Tests for the local-dev inline trajectory resolver.
 
 Cloud Tasks is mocked out at the call site (test_main.py covers the
 swap); here we focus on the worker behavior:
 
-  * happy path: OPSIN → SMILES → _process_smiles_sync → response_url POST
-  * OPSIN user error: error payload posted to response_url, no
-    _process_smiles_sync call
-  * OPSIN unexpected error: generic fallback message posted, no
-    _process_smiles_sync call
+  * happy path: spawns a thread, runs process_and_save_frames, posts to
+    response_url.
+  * unexpected error in the pipeline must NOT kill the thread silently;
+    a generic fallback message is posted instead.
 
 Threading is collapsed to synchronous execution by patching
 ``threading.Thread`` with a fake that invokes the kwargs target inline.
@@ -20,7 +19,6 @@ import pytest
 
 from app import dev_dispatch
 from app.config import reload_settings
-from app.rdkit_utils import MoleculeGenerationError
 
 
 _RESPONSE_URL = "https://hooks.slack.com/commands/T0/1/abc"
@@ -51,16 +49,18 @@ class _SyncThread:
         self._target(**self._kwargs)
 
 
-def _call_kwargs(name: str = "hexafluorobenzene") -> dict:
+def _call_kwargs() -> dict:
     from app.config import get_settings
 
     return {
-        "name": name,
+        "segments": [("name", "hexafluorobenzene")],
+        "was_capped": False,
         "response_url": _RESPONSE_URL,
         "user_id": "U1",
         "channel_id": "C1",
         "base_url": _BASE_URL,
         "settings": get_settings(),
+        "flags": {"public": False, "label": False, "no_3d": False},
     }
 
 
@@ -73,89 +73,48 @@ def test_run_inline_spawns_thread_and_returns_synthetic_task_name():
         ret = dev_dispatch.run_inline_name_resolution(**_call_kwargs())
     assert ret.startswith("dev-inline-task/")
     assert mthread.call_count == 1
-    # The fake thread instance's start() must have been called.
     mthread.return_value.start.assert_called_once()
 
 
-def test_run_inline_happy_path_resolves_and_posts_to_response_url():
-    """End-to-end (sync-thread): OPSIN returns a SMILES,
-    _process_smiles_sync builds the viewer payload, response_url POST
-    runs.
-    """
+def test_run_inline_happy_path_calls_process_and_posts():
+    """End-to-end (sync-thread): process_and_save_frames returns a
+    payload, response_url POST runs once with that payload."""
     fake_payload = {
         "response_type": "ephemeral",
         "replace_original": False,
-        "text": "3D viewer generated: https://x/view/abc",
+        "text": "ok",
     }
-    # Patch app.main._process_smiles_sync via the late-import boundary.
-    # The thread target imports it inside the function body, so we patch
-    # it at the source module.
     with mock.patch.object(dev_dispatch.threading, "Thread", _SyncThread), \
-         mock.patch.object(
-            dev_dispatch, "iupac_to_smiles", return_value="Fc1c(F)c(F)c(F)c(F)c1F"
-         ) as mopsin, \
          mock.patch(
-            "app.main._process_smiles_sync", return_value=fake_payload
+            "app.main.process_and_save_frames", return_value=fake_payload
          ) as mproc, \
          mock.patch.object(
             dev_dispatch.slack_dispatch, "post_to_response_url", return_value=True
          ) as mpost:
-        ret = dev_dispatch.run_inline_name_resolution(**_call_kwargs())
-    assert ret.startswith("dev-inline-task/")
-    assert mopsin.call_count == 1
+        dev_dispatch.run_inline_name_resolution(**_call_kwargs())
     assert mproc.call_count == 1
-    proc_kwargs = mproc.call_args.kwargs
-    assert proc_kwargs["smiles"] == "Fc1c(F)c(F)c(F)c(F)c1F"
-    assert proc_kwargs["input_name"] == "hexafluorobenzene"
+    pkw = mproc.call_args.kwargs
+    assert pkw["segments"] == [("name", "hexafluorobenzene")]
+    assert pkw["was_capped"] is False
+    assert pkw["base_url"] == _BASE_URL
     assert mpost.call_count == 1
     posted_url, posted_payload = mpost.call_args.args
     assert posted_url == _RESPONSE_URL
     assert posted_payload == fake_payload
 
 
-def test_run_inline_opsin_user_error_posts_error_message():
-    """OPSIN MoleculeGenerationError must propagate to a Slack-friendly
-    text and NOT call the SMILES pipeline.
-    """
+def test_run_inline_unexpected_error_posts_generic_message():
+    """An unexpected exception from the pipeline must be caught so the
+    thread does not silently die; a generic message goes to Slack."""
     with mock.patch.object(dev_dispatch.threading, "Thread", _SyncThread), \
-         mock.patch.object(
-            dev_dispatch,
-            "iupac_to_smiles",
-            side_effect=MoleculeGenerationError("OPSIN は体系名のみ対応です..."),
-         ), \
          mock.patch(
-            "app.main._process_smiles_sync"
-         ) as mproc, \
+            "app.main.process_and_save_frames",
+            side_effect=RuntimeError("boom"),
+         ), \
          mock.patch.object(
             dev_dispatch.slack_dispatch, "post_to_response_url", return_value=True
          ) as mpost:
         dev_dispatch.run_inline_name_resolution(**_call_kwargs())
-    assert mproc.call_count == 0
     assert mpost.call_count == 1
     _, posted_payload = mpost.call_args.args
-    assert "OPSIN" in posted_payload["text"]
-
-
-def test_run_inline_opsin_unexpected_error_posts_generic_message():
-    """An unexpected (non-user) exception from OPSIN must be caught so
-    the thread does not silently die; a generic message is sent to
-    Slack.
-    """
-    with mock.patch.object(dev_dispatch.threading, "Thread", _SyncThread), \
-         mock.patch.object(
-            dev_dispatch,
-            "iupac_to_smiles",
-            side_effect=RuntimeError("subprocess crashed"),
-         ), \
-         mock.patch(
-            "app.main._process_smiles_sync"
-         ) as mproc, \
-         mock.patch.object(
-            dev_dispatch.slack_dispatch, "post_to_response_url", return_value=True
-         ) as mpost:
-        dev_dispatch.run_inline_name_resolution(**_call_kwargs())
-    assert mproc.call_count == 0
-    assert mpost.call_count == 1
-    _, posted_payload = mpost.call_args.args
-    assert "OPSIN" in posted_payload["text"]
-    assert "エラー" in posted_payload["text"]
+    assert "fail" in posted_payload["text"].lower()

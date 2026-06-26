@@ -11,24 +11,36 @@ from app.templates import (
 )
 
 
-def test_viewer_with_molblock_includes_smiles_and_data():
+def _frames_json_from_html(html: str):
+    """Pull the ``const frames = [...]`` JS literal back out of the page
+    and JSON-decode it. The ``</``-escape we apply on embed must be
+    reversed before parsing."""
+    m = re.search(r"const frames = (.+?);\s*\n\s*const initialMolId",
+                  html, re.DOTALL)
+    assert m is not None, "frames literal not found"
+    js_literal = m.group(1)
+    json_str = js_literal.replace("<\\/", "</")
+    return json.loads(json_str)
+
+
+def test_viewer_with_molblock_embeds_frame_in_js():
     smiles = "CCO"
     molblock = "Mrv0541 12345\n\n  9  8\nM  END\n"
     html = render_viewer_html(smiles, molblock, "abc123")
     assert "CCO" in html
-    # The MolBlock string should appear as a JS string literal (json-encoded).
-    encoded = json.dumps(molblock)
-    encoded_safe = encoded.replace("</", "<\\/")
-    assert encoded_safe in html
-    # No D&D drop-zone hint should appear when molblock is provided.
+    parsed = _frames_json_from_html(html)
+    assert len(parsed) == 1
+    assert parsed[0]["smiles"] == "CCO"
+    assert parsed[0]["molblock"] == molblock
+    # No D&D drop-zone hint should appear when a frame is provided.
     assert "ファイルをここにドロップ" not in html
 
 
-def test_viewer_without_molblock_shows_drop_zone():
-    html = render_viewer_html(None, None, None)
+def test_viewer_without_frames_shows_drop_zone():
+    html = render_viewer_html(frames=[])
     assert "ファイルをここにドロップ" in html
-    # The script should still initialise but with no preloaded model.
-    assert "const initialMolblock = null;" in html
+    parsed = _frames_json_from_html(html)
+    assert parsed == []
 
 
 def test_molblock_with_script_terminator_is_escaped():
@@ -38,21 +50,15 @@ def test_molblock_with_script_terminator_is_escaped():
     html = render_viewer_html("CCO", nasty, "id1")
     # Raw substring must NOT appear in the HTML.
     assert "</script><script>alert" not in html
-    # The escaped form must appear.
+    # The escaped form must appear (inside the frames JSON literal).
     assert "<\\/script>" in html
 
 
 def test_molblock_with_backticks_and_newlines_round_trip_safe():
     nasty = "line1\nline2`backtick`\n\\backslash\\\n\"quote\""
     html = render_viewer_html("CCO", nasty, "id1")
-    # The embedded JS literal must be a valid JSON string (after un-doing
-    # the </ escape) that decodes back to the original MolBlock.
-    m = re.search(r"const initialMolblock = (.+?);", html, re.DOTALL)
-    assert m is not None
-    js_literal = m.group(1)
-    # Reverse the </-escape before JSON parsing.
-    json_str = js_literal.replace("<\\/", "</")
-    assert json.loads(json_str) == nasty
+    parsed = _frames_json_from_html(html)
+    assert parsed[0]["molblock"] == nasty
 
 
 def test_not_found_html_has_japanese_message():
@@ -66,7 +72,7 @@ def test_expired_html_mentions_retention_days():
 
 
 def test_drop_zone_lists_supported_formats():
-    html = render_viewer_html(None, None, None)
+    html = render_viewer_html(frames=[])
     for fmt in ("pdb", "sdf", "mol2", "xyz", "cube"):
         assert fmt in html
 
@@ -82,10 +88,9 @@ def test_viewer_guards_against_missing_3dmol_cdn():
 
 
 def test_drop_zone_is_exposed_to_assistive_tech():
-    html = render_viewer_html(None, None, None)
+    html = render_viewer_html(frames=[])
     # The drop-zone is informational; it must NOT carry aria-hidden.
     assert 'id="dropzone"' in html
-    # The whole rendered HTML must contain no aria-hidden on the dropzone.
     assert 'id="dropzone" aria-hidden' not in html
 
 
@@ -95,7 +100,5 @@ def test_reset_view_restores_initial_camera():
     view. The viewer must snapshot getView() right after the model
     loads and use setView() on Reset to restore the full camera."""
     html = render_viewer_html("CCO", "M  END\n", "id1")
-    # Snapshot is taken after the initial render.
     assert "initialView = viewer.getView();" in html
-    # Reset handler uses setView, not a bare zoomTo.
     assert "viewer.setView(initialView)" in html

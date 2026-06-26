@@ -23,7 +23,23 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         default-jre-headless \
+        libxrender1 \
+        libxext6 \
+        libexpat1 \
+        libfontconfig1 \
+        libfreetype6 \
+        libcairo2 \
     && rm -rf /var/lib/apt/lists/*
+# ``rdkit.Chem.Draw.rdMolDraw2D`` loads the full cairo/freetype/font
+# stack at import time on Linux, even when only the pure-SVG renderer
+# (``MolDraw2DSVG``) is used. python:3.11-slim ships none of these.
+# The cascade we hit on first deploy was:
+#   ImportError: libXrender.so.1: cannot open shared object file
+#   ImportError: libexpat.so.1: cannot open shared object file
+# All five extra packages are needed together; adding them piecewise
+# costs one ~6-min Cloud Build per iteration. libcairo2 transitively
+# pulls fontconfig + freetype + expat, but listing them explicitly
+# keeps the dependency intent obvious in this file.
 
 WORKDIR /app
 

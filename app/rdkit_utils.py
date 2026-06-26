@@ -9,7 +9,15 @@ from __future__ import annotations
 
 from rdkit import Chem
 from rdkit.Chem import AllChem, Descriptors
-from rdkit.Chem.Draw import rdMolDraw2D
+
+# ``rdkit.Chem.Draw.rdMolDraw2D`` is imported lazily inside
+# :func:`molblock_to_svg` to keep the top-level import path resilient
+# to missing native libs on slim Linux base images. If the image lacks
+# libcairo / libxrender / libexpat / libfontconfig / libfreetype, the
+# 2D depiction endpoint surfaces ``None`` (and the template renders the
+# Japanese fallback message) instead of crashing the whole process on
+# container start. The Dockerfile installs all of those, so this is
+# defence-in-depth, not a runtime expectation.
 
 
 EMBED_SEEDS: tuple[int, ...] = (0xF00D, 0xBEEF, 0x1234)
@@ -147,6 +155,11 @@ def molblock_to_svg(
     if not molblock:
         return None
     try:
+        # Lazy import (see module docstring): pushes any missing-shared-
+        # object failures to /view ?mode=2d request time, not container
+        # startup.
+        from rdkit.Chem.Draw import rdMolDraw2D
+
         mol = Chem.MolFromMolBlock(molblock, removeHs=False)
         if mol is None:
             return None

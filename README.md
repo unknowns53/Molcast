@@ -1,310 +1,148 @@
-# Molcast — Slack 分子可視化ボット
+# Molcast
 
-生成された SMILES、IUPAC 名、座標ファイルから小分子を 3D 可視化する研究室内 Slack ツール。Cloud Run + FastAPI + Firestore + RDKit + 3Dmol.js で構築されている。設計ブリーフ全体は `Slack_分子可視化ボット_統合版_v2.md` にあり、この README ではサービスの実行・デプロイ・運用について記述する。
+研究室の Slack から小分子の 3D 構造を秒で出す。SMILES でも IUPAC 名でも、複数を並べてトラジェクトリ的に切り替えても OK。座標ファイル (`.pdb` / `.sdf` / `.mol2` / `.xyz` / `.cube`) はブラウザに D&D で読ませる。
 
-リポジトリは Phase 1 (SMILES → 3D ビューア)、Phase 2 (座標ファイル D&D)、Phase 3 (OPSIN による IUPAC / 慣用名のパース) まで実装済み。Phase 3 では `app/opsin_utils.py` が慣用名 mapping → 同梱 OPSIN JAR (`py2opsin` wheel に同梱) → EBI OPSIN Web の三段構えで `name:` 経路を解決する。バックエンドは `OPSIN_BACKEND` 環境変数で `local` / `local_only` / `web` を選択。
+## 5 秒で試す
 
-## 1. 概要
-
-### できること
-
-- `/mol <SMILES>` → サーバ側で 3D の MolBlock を生成し、ボットが `https://<service>/view/<random-id>` を返す。URL を開くと 3Dmol.js で分子が描画される (stick / ball-and-stick / sphere の各表示)。
-- `/mol` (引数なし) → ボットが素のビューアページ (`/view/`) へのリンクを返す。そこに `pdb` / `sdf` / `mol2` / `xyz` / `cube` ファイルをドロップするとブラウザ内で描画される。
-- `/mol name: <IUPAC 名 or 慣用名>` → 慣用名 (DMSO, THF, スチレン 等) は `app/opsin_aliases.json` で即解決、それ以外は OPSIN を呼んで SMILES に変換してから SMILES 経路と同じビューアを返す。
-
-### 用途外のもの
-
-ざっくりとした見た目の確認用途のみ。配座探索、MMFF/UFF 単発を超える構造最適化、DFT、MD、OCSR は明示的に対象外で、その用途には RDKit / Gaussian / GROMACS を使う。
-
-## 2. Slack App のセットアップ
-
-1. <https://api.slack.com/apps> を開いて **Create New App** → *From scratch* をクリック。名前 (例: `Molcast`) と対象ワークスペースを指定する。
-2. **OAuth & Permissions** → *Scopes* → *Bot Token Scopes* で `commands` と `chat:write` を追加する。
-3. **Basic Information** から **Signing Secret** をコピーする。Secret Manager に保管する — §8 を参照。
-4. アプリをワークスペースにインストールする。*Require approved apps* が有効な場合、ワークスペース管理者の承認が先に必要。
-
-## 3. Slash command のセットアップ
-
-**Slash Commands** → *Create New Command*:
-
-| Field | Value |
-|---|---|
-| Command | `/mol` |
-| Request URL | `https://<cloud-run-url>/slack/mol` |
-| Short description | `SMILES や座標ファイルから 3D 分子ビューアを生成` |
-| Usage hint | `<SMILES> または name: <IUPAC>` |
-
-保存する。新しいコマンドを反映するためにアプリをワークスペースに再インストールする。
-
-## 4. 環境変数
-
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `SLACK_SIGNING_SECRET` | yes | — | Slack リクエスト署名 (HMAC-SHA256) |
-| `SLACK_RESPONSE_TYPE` | no | `ephemeral` | `ephemeral` か `in_channel` |
-| `BASE_URL` | no | リクエストから取得 | `/view/{id}` リンクに使う |
-| `FIRESTORE_COLLECTION` | no | `molecules` | Firestore のコレクション名 |
-| `RETENTION_DAYS` | no | `7` | `/view/{id}` の TTL |
-| `MAX_ATOMS` | no | `200` | `AddHs` 後の原子数ゲート |
-| `OPSIN_BACKEND` | no | `local` | Phase 3: `local` / `local_only` / `web` |
-| `OPSIN_JAR_PATH` | no | `/opt/opsin/opsin.jar` | Phase 3 のフォールバックパス |
-| `OPSIN_WEB_URL` | no | `https://opsin.ch.cam.ac.uk/opsin/` | Phase 3 の EBI エンドポイント |
-| `TASKS_PROJECT_ID` | name: 経路で必須 | 空 | Phase 3 二段フロー: Cloud Tasks queue を持つ GCP プロジェクト |
-| `TASKS_QUEUE_ID` | name: 経路で必須 | 空 | 例: `molcast-name-resolution` |
-| `TASKS_LOCATION` | no | `asia-northeast1` | Cloud Run と同一リージョン |
-| `TASKS_INVOKER_SA` | name: 経路で必須 | 空 | Cloud Tasks が OIDC token を発行する SA |
-| `INTERNAL_PROCESS_PATH` | no | `/internal/process` | Cloud Tasks が叩く内部エンドポイント |
-| `IDEMPOTENCY_COLLECTION` | no | `molecules_idempotency` | Cloud Tasks at-least-once 配信のデデュープ用 |
-| `IDEMPOTENCY_TTL_SECONDS` | no | `3600` | 同上、TTL ポリシーで自動 expire させたい場合の参考値 |
-| `LOG_LEVEL` | no | `INFO` | Python `logging` のレベル |
-| `PORT` | — | Cloud Run が注入 | Uvicorn のバインドポート |
-| `DEV_SKIP_SIGNATURE_VERIFICATION` | no | `false` | ローカル開発専用。`/slack/mol` の Slack 署名検証をスキップ。**Cloud Run には絶対に設定しない** |
-| `DEV_INLINE_NAME_RESOLUTION` | no | `false` | ローカル開発専用。`name:` 経路を Cloud Tasks ではなくバックグラウンドスレッドで inline 実行。**Cloud Run には絶対に設定しない** |
-
-`EMBED_MAX_RETRIES` は意図的に外に出していない。各試行は独自の ETKDGv3 パラメータセットを使うため、埋め込み再試行回数は 3 回で固定している (`app/rdkit_utils.py` および設計ブリーフ §6.1 を参照)。
-
-## 5. ローカル開発
-
-```bash
-python -m venv .venv
-. .venv/bin/activate           # または: .venv\Scripts\activate
-pip install -r requirements-dev.txt
-cp .env.example .env
-
-# 単体テストを実行 (Firestore は不要 — ストアはモック化されている):
-pytest
-
-# サービスを起動。Firestore のクレデンシャルが無いと /view/{id} と
-# /slack/mol の POST エンドポイントは Firestore 呼び出しで落ちる。
-# /health、/view/、/、手動 D&D のビューアエンドポイントは動く。
-uvicorn app.main:app --reload
-```
-
-ローカルで Firestore 経由のパスを試したい場合は、Firestore エミュレータを並行起動する (`gcloud components install cloud-firestore-emulator` を実行した後で):
-
-```bash
-gcloud emulators firestore start --host-port=localhost:8088
-# 別シェルで:
-export FIRESTORE_EMULATOR_HOST=localhost:8088
-uvicorn app.main:app --reload
-```
-
-Windows での `rdkit`: Python 3.11 の pip wheel は動作する (Docker イメージのランタイムと合わせている)。pip install が手元の環境で失敗するなら、Cloud Run のビルド経路 (`gcloud run deploy --source .`) が動作する環境を作る正規ルート。
-
-### HTTPS トンネル経由で Slack から実機テスト (UX 磨きの開発ループ)
-
-文言・viewer 装飾・alias 追加など軽い iteration のために `gcloud run deploy` (1 サイクル 5-8 分) を毎回叩いていると磨きが進まない。`uvicorn --reload` + HTTPS トンネル + 2 つの dev フラグで、ローカル uvicorn を Slack のスラッシュコマンドから秒で叩ける形にできる。
-
-**準備**
-
-`.env` に dev フラグを足す (`.env` は gitignore 済み):
+Slack で:
 
 ```
-DEV_SKIP_SIGNATURE_VERIFICATION=true
-DEV_INLINE_NAME_RESOLUTION=true
-OPSIN_BACKEND=web        # JRE をローカルに入れないなら web 経由が楽
-SLACK_RESPONSE_TYPE=ephemeral
-BASE_URL=                # トンネル URL は起動時に決まるので空でよい (リクエストから取得)
-```
-
-**手順**
-
-1. uvicorn をローカルで起動 (リクエスト毎に reload):
-
-   ```powershell
-   .venv\Scripts\activate
-   uvicorn app.main:app --reload --host 127.0.0.1 --port 8080
-   ```
-
-   起動ログに `dev_flags_active` の WARNING が出ているのを確認 (出ていなければフラグが効いていない)。
-
-2. 別シェルで cloudflared で HTTPS トンネルを張る (cloudflared インストール: <https://github.com/cloudflare/cloudflared/releases> の Windows バイナリを PATH に置く):
-
-   ```powershell
-   cloudflared tunnel --url http://localhost:8080
-   ```
-
-   ターミナルに `https://<random>.trycloudflare.com` の URL が出る。サインアップ不要の quick tunnel。
-
-3. Slack App の **Slash Commands → /mol** を編集し、*Request URL* を `https://<random>.trycloudflare.com/slack/mol` に一時的に書き換える。Save。Slack 側の再インストールは不要。
-
-4. Slack から `/mol CCO` や `/mol name: DMSO` を投げると、ローカル uvicorn でハンドルされる。`app/*.py` を編集して保存すると uvicorn が即 reload するので、次のリクエストは新しいコードで処理される。
-
-5. テストが終わったら Slack の Request URL を本番 (`https://mol-slack-viewer-...run.app/slack/mol`) に戻す。
-
-**caveat**
-
-- 同じ Slack ワークスペースの他者が `/mol` を使いたい時間帯はこの手順を避ける (Request URL が一時的に自分のローカルを向いているため)。磨き専用の Slack ワークスペースを別途用意するのが安全。
-- Firestore は本物 (asia-northeast1 のプロジェクト) に書き込みに行くので、ローカルで生成した分子も本番の `molecules` コレクションに残る。気になるなら Firestore エミュレータを並走 (§5 の手順) + `FIRESTORE_EMULATOR_HOST` を設定。
-- `DEV_*` フラグは Cloud Run 側の env vars には**絶対に**含めない (`gcloud run deploy --set-env-vars` に書かない)。本番に紛れ込むと署名検証や Cloud Tasks が崩れる。`deploy.sh` も `DEV_*` を含まない設計。
-
-## 6. `name:` 経路 (Phase 3) のローカル開発
-
-OPSIN は 3 つのモード (`OPSIN_BACKEND`) で動く:
-
-- `local` — `app/opsin_aliases.json` の慣用名を先に引き、次に同梱 OPSIN JAR (`py2opsin` wheel に同梱の `opsin-cli-*-jar-with-dependencies.jar` を `subprocess.run` 経由で呼ぶ。タイムアウト 10 秒)。これも失敗したら EBI OPSIN Web (タイムアウト 5 秒) にフォールバック。本番のデフォルト。
-- `local_only` — alias → ローカル OPSIN のみ。Web フォールバックを切る。CI で JRE 欠落を確実に検知したいときに使う。
-- `web` — alias → EBI OPSIN Web のみ。`py2opsin` の import 自体をスキップするので、手元に JRE を入れたくないローカル開発で便利。
-
-ホスト側で `local` / `local_only` モードのテストを動かしたいときは Temurin 17 (もしくは JRE 11+) を入れる:
-
-```bash
-# macOS
-brew install --cask temurin@17
-# Debian/Ubuntu
-sudo apt install default-jre-headless
-# Windows: Temurin を https://adoptium.net/ からダウンロード
-```
-
-`tests/test_opsin_utils.py` は `subprocess.run` と `httpx.get` を mock するので、CI / 通常開発では JRE 不要 (alias JSON の RDKit round-trip 検証は走る)。同様に `tests/test_main.py`, `tests/test_tasks_dispatch.py`, `tests/test_oidc_verify.py` も Cloud Tasks クライアントと OIDC 検証を mock するので、ローカル開発で GCP クレデンシャルや `gcloud auth` は要らない。Cloud Tasks 経由の二段フローを実機で確認したいときだけ `DEPLOY.md §5.6` の手順で Queue / SA を作成する。
-
-## 7. Docker ビルド
-
-```bash
-docker build -t molcast .
-
-# ローカルのスモークテスト (Firestore クレデンシャルなし):
-docker run --rm -p 8080:8080 \
-    -e SLACK_SIGNING_SECRET=dummy \
-    -e GOOGLE_APPLICATION_CREDENTIALS=/dev/null \
-    molcast
-# http://localhost:8080/health を開く
-```
-
-イメージはシングルステージ (`python:3.11-slim` + `ca-certificates` + `default-jre-headless` + RDKit + py2opsin)。OPSIN は `subprocess` 経由で JAR を叩くので JVM のウォームアップは毎回かかる (~1-2 秒)。
-
-## 8. Cloud Run へのデプロイ
-
-1. プロジェクトを作成して API を有効化する:
-
-   ```bash
-   gcloud config set project YOUR_PROJECT_ID
-   gcloud services enable run.googleapis.com \
-       firestore.googleapis.com \
-       secretmanager.googleapis.com \
-       artifactregistry.googleapis.com
-   ```
-
-2. Slack の signing secret を Secret Manager に保管する:
-
-   ```bash
-   echo -n "$(read -s SS; echo "$SS")" | \
-       gcloud secrets create slack-signing-secret \
-           --data-file=- --replication-policy=automatic
-   ```
-
-3. デプロイ:
-
-   ```bash
-   PROJECT_ID=YOUR_PROJECT_ID ./deploy.sh
-   ```
-
-4. 表示されるサービス URL を控え、末尾に `/slack/mol` を付けたものを Slack コマンドの *Request URL* に貼り付ける。
-
-## 9. Firestore の有効化と TTL
-
-1. GCP コンソールの **Firestore → Native mode** で、リージョンに `asia-northeast1` (Cloud Run と同じ) を選ぶ。Native mode が必須。
-2. コードはリクエストごとの期限チェックで `expires_at` を使っているため、TTL ポリシーは任意。自動削除を有効化する場合 (反映に最大 24 時間の遅延あり):
-
-   - **Firestore → TTL → Add policy**
-   - Collection: `molecules`
-   - Field: `expires_at`
-
-   TTL ポリシーを有効化するまで期限切れドキュメントは残り続けるが、`/view/{id}` は期限切れページを正しく返す (コードが `{"expired": True}` センチネルで弾く)。
-
-## 10. 使用例
-
-```text
 /mol CCO
-  → 3D viewer generated: https://<service>/view/abcd...
-
-/mol C/C=C/C
-  → trans-2-butene (E)
-
-/mol C/C=C\\C
-  → cis-2-butene (Z)
-
-/mol C[C@H](N)C(=O)O
-  → L-alanine
-
-/mol not_a_smiles
-  → SMILES の解釈に失敗しました。表記をご確認ください。
-
-/mol
-  → 使い方: /mol <SMILES> ...
-    座標ファイルを描画するには https://<service>/view/ を ...
-
-# Phase 3 (name: 経路、Cloud Tasks 二段化)
-# まず即時 ack「処理中です... 完了したら結果を投稿します。」が ephemeral で表示され、
-# その後に下記が response_url 経由で後追い投稿される。
-/mol name: ethanol
-  → 3D viewer generated: https://<service>/view/abcd...   # alias hit (CCO)
-/mol name: DMSO
-  → 3D viewer generated: ...                              # alias hit (CS(C)=O)
-/mol name: 4-vinylpyridine
-  → 3D viewer generated: ...                              # alias hit (C=Cc1ccncc1)
-/mol name: hexafluorobenzene
-  → 3D viewer generated: ...                              # OPSIN local 解決 (~5-15 秒)
-/mol name: メタノール
-  → 3D viewer generated: ...                              # alias hit (CO)、kana 経路
-/mol name: not_a_real_compound
-  → OPSIN は体系名のみ対応です。慣用名・商品名は解釈できません。
-    SMILES を直接入力してください: /mol <SMILES>
 ```
 
-座標ファイル (Phase 2) はブラウザで `/view/` を開き、ビューア領域にファイルをドロップする。対応フォーマットは `pdb`、`sdf`、`mol2`、`xyz`、`cube`。CIF は手元で OpenBabel で変換する:
+エタノールの 3D ビューア URL が ephemeral で返ってくる。クリックして開けば、stick / ball & stick / sphere の切替、回転、原子ラベル表示、PNG 保存、SMILES コピーまで一通り使える。
+
+## コマンドの形
+
+### 単体 — SMILES そのまま
+
+```
+/mol CCO
+/mol C/C=C/C                 # E/Z 立体化学保持
+/mol C[C@H](N)C(=O)O         # L-Ala
+/mol CC(C)NC(=O)C=C          # NIPAM
+```
+
+### 単体 — 名前から (`name:` プレフィクス)
+
+```
+/mol name: DMSO              # エイリアス即解決
+/mol name: NIPAM             # 同上
+/mol name: hexafluorobenzene # OPSIN がパース → ~5-15 秒で返る
+/mol name: メタノール        # 日本語のかな表記も alias 登録あり
+```
+
+### 複数構造を並べる — トラジェクトリ
+
+`;` 区切りで N 構造を 1 つのビューアに乗せる。ビューア下部の `◀ 1/3 ▶` で送り戻り、矢印キー (`←` / `→`) も効く。
+
+```
+/mol CCO ; CC(C)O ; CC(C)(C)O                # 第一・第二・第三アルコール比較
+/mol name: NIPAM ; name: NIPMAM ; name: NVCL # 温度応答性モノマー 3 種
+/mol CCO ; name: DMSO ; CC#N                 # SMILES と name 混在 OK
+```
+
+各フレームに失敗があっても、ナビ上は `✗` 印で残るのでどこで詰まったかが見える (他のフレームの順序は崩れない)。サーバ側の上限は 20 フレーム。超えると先頭 20 個だけ生成して「破棄しました」の警告が末尾に付く。
+
+### 引数なし — ヘルプ + 座標ファイル D&D
+
+```
+/mol
+```
+
+使い方の短文と、座標ファイル D&D 用のビューア URL (`/view/`) が返ってくる。そのページに `.pdb` / `.sdf` / `.mol2` / `.xyz` / `.cube` ファイルをドロップするとそのまま描画される。CIF は手元で OpenBabel で変換する:
 
 ```bash
 obabel input.cif -O output.xyz
 ```
 
-## 11. 運用とチューニング
+## フラグ
 
-### Slack ハンドラのフロー
+スラッシュコマンドの末尾 (or 途中) にトークンとして付ける。順不同。
 
-経路ごとに 2 種類:
+| フラグ | 効果 |
+|---|---|
+| `--public` | 結果をチャンネル全員に投稿 (`response_type=in_channel`)。デフォルトは ephemeral (自分にしか見えない) |
+| `--label` | ビューアを開いた時点で原子ラベル表示 ON。後からビューア上のボタンで切り替えてもよい |
+| `--no-3d` | 3Dmol.js の代わりに RDKit の 2D 描画 (SVG inline) を返す。Slack でサクッと構造式画像を共有したいとき向け |
 
-- **SMILES 経路**: `/slack/mol` を**同期処理**で完結 (Phase 1 で実証)。RDKit embed + Firestore で 3 秒 ack 窓内に収まる。
-- **`name:` 経路**: **二段フロー** (Phase 3 で導入)。`/slack/mol` で Cloud Tasks に enqueue + ack 即返 (「処理中です...」) → `/internal/process` を Cloud Tasks が OIDC token 付きで叩く → OPSIN + RDKit + Firestore + Slack `response_url` POST。
+複数同時 OK:
 
-Cloud Run の `cpu-throttling=always` (デフォルト) は FastAPI の `BackgroundTasks` を ack 返却直後に絞ってしまうため、ack 後の重い処理は同一インスタンス内では実行できない。`name:` 経路の OPSIN local backend は JVM 起動 (`java -jar` を毎回起動) で 1-2 秒のオーバーヘッドが恒常的に乗るので、3 秒 ack 内に収めるのは無理がある。そこで Cloud Tasks にタスクを「投げ直す」形で同一インスタンスを再度のリクエストとして起こす。これなら cpu-throttling=always を維持したまま (アイドル時 0 課金) 重い処理を許容できる。
-
-重複処理対策は二段防衛: (a) Cloud Tasks の deterministic task name (`sha256(response_url)`) で Slack のスラッシュコマンドリトライを CT 側で弾く、(b) Firestore `molecules_idempotency` コレクションへの `create()` で CT の at-least-once 内部リトライ (worker クラッシュ後など) を弾く。
-
-Cloud Tasks のセットアップは `DEPLOY.md §5.6` 参照。Queue 作成 + invoker SA 作成 + CT P4SA から invoker SA への `serviceAccountTokenCreator` 付与 + invoker SA への Cloud Run `roles/run.invoker` 付与 + 環境変数の設定の 5 ステップ。
-
-### コールドスタート
-
-`--min-instances 1` 無しだと Cloud Run は数分のアイドル後にインスタンスを 0 まで落とす。アイドル明け初回リクエストは RDKit の import (~1 秒) + インスタンス起動 (~1〜2 秒) + RDKit embed (CCO で ~0.5 秒) で計 3 秒前後 — Slack の 3 秒 ack 制限のギリギリ。普通分子なら大半通るが、運悪く溢れたら `アプリが応答しなかった` として Slack 側でタイムアウト表示される。その場合はユーザーが同じコマンドを再投入すれば warm インスタンスで通る。
-
-頻発するなら以下に切り替える:
-
-```bash
-MIN_INSTANCES=1 PROJECT_ID=... ./deploy.sh
+```
+/mol CCO ; CC(C)O --public --label --no-3d
 ```
 
-`--min-instances 1` は 1 インスタンスを 24 時間常時暖機状態に保つ。cpu-throttling は default のままなのでアイドル時の CPU 課金は無く、メモリ常時分の課金が乗るだけ — 月数百円程度 (実トラフィック次第で `asia-northeast1` の Cloud Run 価格表を参照)。
+このフラグセットは全フレーム共通で適用される。
 
-### ロギング
+## ビューアのボタン
 
-ログは stdout への構造化 JSON で、Cloud Logging が自動で拾う。許可された構造化フィールドは `app/logging_config.py` に列挙されている。**SMILES 本体と MolBlock は生のまま記録されることは絶対に無い**、記録するのはサイズ・件数・識別子だけ。
+| ボタン | 動作 |
+|---|---|
+| Stick | 棒モデル表示 |
+| Ball & Stick | 球棒モデル (デフォルト) |
+| Sphere | 球モデル (van der Waals 半径風) |
+| Reset | 初期視点に戻す (位置・回転・ズーム全部) |
+| Labels | 原子記号を表示 ON/OFF。Shift+クリックで H も含めるモードに切替 (デフォルトは H 省略) |
+| Rotate | y 軸まわりの自動回転 ON/OFF |
+| Copy SMILES | 現在フレームの SMILES をクリップボードへ |
+| Save PNG | 現在フレームの viewer 画像を `molcast-<id>-<frame>.png` で DL |
+| ◀ / ▶ | フレーム送り (トラジェクトリ時のみ表示)。`←` / `→` キーでも切替可 |
 
-ERROR レベルの例外スタックトレースは `gcloud run services logs read` だと出ない場合があるので、Firestore 例外や RDKit 例外を追うときは Cloud Logging コンソール (<https://console.cloud.google.com/logs>) で severity フィルタ `>= ERROR` を使うのが手早い。
+右上の半透明オーバーレイに **分子式 / 分子量 / SMILES** が常時出る。フレーム切替で内容も更新される。
 
-### `response_url` のリトライ (Phase 3 用、Phase 1 では未使用)
+## URL クエリ
 
-`app/slack_dispatch.py` は 5xx またはネットワークエラー時に `response_url` への POST を 2 回 (指数バックオフ) 再試行する実装が入っているが、Phase 1 の同期フローでは呼ばれない。Phase 3 で `name:` 経路を非同期化するときに再利用する。継続的に失敗するとログに `response_url POST failed after retries` として残るので、その時に Cloud Logging でこの文字列を検索する。
+ビューア URL 自体に直接付けても効く。Slack からのリンクと同じ場所に飛ぶ:
 
-## 12. セキュリティに関するメモ
+| クエリ | 効果 |
+|---|---|
+| `?label=1` | 開いた時点で原子ラベル ON (= `--label`) |
+| `?rotate=1` | 開いた時点で自動回転 ON |
+| `?mode=2d` | 2D SVG 表示に切り替え (= `--no-3d`) |
+| `?frame=3` | 指定フレームから開始 (1-indexed、トラジェクトリ時のみ) |
 
-- **Signing secret の扱い。** 生のシークレットを `deploy.sh`、`.env`、コミット対象のファイルに置かない。Secret Manager に置き、`--set-secrets` でランタイム注入する (`deploy.sh` を参照)。
-- **ログ漏洩なし。** 構造化ロガーはホワイトリスト化されたフィールドのみ出力する。uvicorn のアクセスログフィルタはクエリ文字列をマスクする。新しいログ呼び出しを追加する場合、生の SMILES を `extra=` で渡さないこと。
-- **`/view/{id}` は推測不能だが認証は無い。** URL を知っている人なら誰でも分子を閲覧できるので、その閲覧に関しては URL 自体がシークレットだと考える。Phase 1 / 2 / 3 は機密データ向けには設計されていない (設計ブリーフ §1 を参照)。
-- **原子数ゲート。** `AddHs` 後の `MAX_ATOMS=200` で最も明白な DoS ペイロード (キロ原子クラスの SMILES) は弾けるが、悪意ある呼び出し側が 199 原子の埋め込み再試行に RDKit の CPU を浪費させることは依然として可能。悪用が顕在化してきたら、Cloud Run の同時実行数上限 (`--concurrency`) かユーザー単位のレート制限を追加する。
-- **Pre-commit フック。** このリポジトリは `hooks/pre-commit` と `hooks/commit-msg` を同梱しており、`.git-banned-patterns` (gitignore 済み) を読んで個人識別子の誤コミットを機械的に止める。新規 clone 時:
+組み合わせ可: `?label=1&rotate=1&frame=2`
 
-  ```bash
-  cp .git-banned-patterns.example .git-banned-patterns
-  # 好みで編集する
-  git config core.hooksPath hooks
-  ```
+## エイリアス
+
+`name:` 経路で OPSIN を呼ばずに即解決される慣用名・略号は `app/opsin_aliases.json` にカテゴリ分けで 100 件強登録されている:
+
+| カテゴリ | 例 |
+|---|---|
+| solvent | water / H2O / 水, methanol / MeOH / メタノール, DMSO, THF, DMF, NMP, HFIP, D2O, ... |
+| vinyl_monomer | styrene, MMA, NIPAM, NIPMAM, DMAA, DEAA, NVP, NVCL, MEO2MA, EGDMA, ... |
+| sugar | glucose, fructose, sucrose, trehalose, sorbitol, cellobiose, ... |
+| host_compound | 12-crown-4 / 15-crown-5 / 18-crown-6, α/β/γ-CD, [2.2.2]cryptand, ... |
+| initiator | AIBN, KPS, SPS, APS, V-50 |
+| buffer | Tris, HEPES, MES |
+| salt | NaCl, KCl, LiCl, NaBr |
+
+エイリアスは英名・日本語名 (カナ)・略号・別記法など複数を 1 SMILES に紐付けてある。引いて出てこなければ OPSIN local → EBI OPSIN Web の順にフォールバックして体系名としてパースを試みる。
+
+不足を感じたら `app/opsin_aliases.json` に PR で追加 (RDKit round-trip テストが CI で走るので、不正な SMILES は弾かれる)。
+
+## エラーメッセージと対処
+
+| メッセージ | 状況 |
+|---|---|
+| `SMILES の解釈に失敗しました。表記をご確認ください。` | RDKit が SMILES をパースできない。typo の可能性大 |
+| `分子が大きすぎます (上限 200 原子)。座標ファイルを直接ビューアに D&D してください。` | `AddHs` 後の重原子+H 合計 >200。大きい分子は座標ファイル経由で |
+| `3D 構造の生成に失敗しました。立体的に困難な構造の可能性があります。` | ETKDGv3 が 3 回試して embed できなかった。マクロ環や混雑した cage 系で起こる。座標ファイル D&D 推奨 |
+| `OPSIN は体系名のみ対応です。慣用名・商品名は解釈できません。SMILES を直接入力するか、登録済みエイリアスをお使いください。` | `name:` で渡した文字列を OPSIN がパース不能。具体例 3 行付きで返ってくるのでそれを参照 |
+| `保存に失敗しました。しばらく待ってから再度お試しください。` | Firestore 書き込み失敗。一時的な GCP 不調が多い。再投入で大抵通る |
+| `アプリが応答しなかった` (Slack 側表示) | コールドスタート + 3 秒 ack 窓超過。同じコマンドを 2 回目に叩けば warm インスタンスで通る |
+
+## 制限事項
+
+- **ビューア URL の有効期限は 7 日**。過ぎると "この 3D ビューアは期限切れです" のページに切り替わる。必要なら `/mol` を叩き直して再生成する
+- **`/view/{id}` は推測不能だが認証なし**。URL を知っている人なら誰でも見える。機密データ向けではない
+- **同期パス (SMILES 単体・SMILES のみのトラジェクトリ) は Slack 3 秒 ack 窓に依存**。コールドスタートで超えうる。`name:` 含む場合は Cloud Tasks の二段化で 3 秒制約から外れる
+- **2D 描画 (`--no-3d`)** は 600×480 の SVG、立体化学のくさび結合表示はあるが H は省略
+- **配座探索・MMFF/UFF 最適化を超えた構造**は出ない。可視化ツールであって計算ツールではない。本格的にやるなら RDKit / Gaussian / GROMACS
+
+## さらに知る
+
+- ビューア URL / Slack コマンド / Firestore TTL の細部 → `Slack_分子可視化ボット_統合版_v2.md` (設計ブリーフ)
+- Cloud Run へのデプロイ手順 → `DEPLOY.md`
+- ローカル開発・テスト・環境変数・OPSIN バックエンド切替 → `DEVELOPMENT.md`
+- alias の生 SMILES → `app/opsin_aliases.json`
